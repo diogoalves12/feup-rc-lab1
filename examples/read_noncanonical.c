@@ -42,11 +42,9 @@ int main(int argc, char *argv[])
 {
     if (argc < 2)
     {
-        printf("Incorrect program usage\n"
-               "Usage: %s <SerialPort>\n"
-               "Example: %s /dev/ttyS0\n",
-               argv[0],
-               argv[0]);
+        printf("Incorrect program usage\n");
+        printf("Usage: %s <SerialPort>\n", argv[0]);
+        printf("Example: %s /dev/ttyS0\n", argv[0]);
         exit(1);
     }
 
@@ -69,47 +67,53 @@ int main(int argc, char *argv[])
     // NOTE: This while() cycle is a simple example showing how to read from the serial port.
     // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
 
-    // TODO: Save the received bytes in a buffer array and print it at the end of the program.
     int nBytesBuf = 0;
-
-    #define FLAG 0x7E;
-    #define A_SENDER  0x03;
-    #define A_RECEIVER 0x01; 
-    #define C_SET 0x03
-    #define C_UA  0x07;
-    #define FRAME_SIZE 5
-
     while (STOP == FALSE)
     {
-    unsigned char buffer[5];
-    int bytesRead = 0;
+        unsigned char buffer[FRAME_SIZE];
+        int bytesRead = 0;
 
-    printf("Waiting for SET frame...\n");
+        printf("Waiting for SET frame...\n");
 
-    while (bytesRead < 5)
-    {
-        unsigned char byte;
-        int result = readByteSerialPort(&byte);
+        while (bytesRead < FRAME_SIZE)
+        {
+            unsigned char byte;
+            int result = readByteSerialPort(&byte);
+            if (result == 1)
+            {
+                buffer[bytesRead++] = byte;
+                printf("Byte %d received: 0x%02X\n", bytesRead, byte);
+            }
+            else if (result == 0)
+            {
+                continue;
+            }
+            else if (result == -1)
+            {
+                perror("Error reading from serial port");
+                closeSerialPort();
+                exit(1);
+            }
+        }
 
-        buffer[bytesRead++] = byte;
-        printf("Byte %d received: 0x%02X\n", bytesRead, byte);
-    }
+        unsigned char UA[FRAME_SIZE] = {FLAG, A_RECEIVER, C_UA, A_RECEIVER ^ C_UA, FLAG};
 
-    unsigned char UA[FRAME_SIZE] = {FLAG, A_RECEIVER, C_UA, A_RECEIVER ^ C_UA, FLAG };
-    
-    if (writeBytesSerialPort(UA, 5) != 5)
-    {
-        perror("Failed to send UA frame");
-        closeSerialPort();
-        exit(1);
-    }
+        if (writeBytesSerialPort(UA, FRAME_SIZE) != FRAME_SIZE)
+        {
+            perror("Failed to send UA frame");
+            closeSerialPort();
+            exit(1);
+        }
 
-    printf("UA frame sent:\n");
-    for (int i = 0; i < 5; i++)
-    {
-        printf("0x%02X ", UA[i]);
-    }
+        printf("UA frame sent:\n");
+        for (int i = 0; i < FRAME_SIZE; i++)
+        {
+            printf("0x%02X ", UA[i]);
+        }
         printf("\n");
+
+        // For this example, terminate after one iteration
+        STOP = TRUE;
     }
 
     // Close serial port
@@ -174,7 +178,7 @@ int openSerialPort(const char *serialPort, int baudRate)
         fprintf(stderr, "Unsupported baud rate (must be one of 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600, 115200)\n");
         return -1;
     }
-#undef CASE_BAUDRATE
+    #undef CASE_BAUDRATE
 
     // New port settings
     struct termios newtio;

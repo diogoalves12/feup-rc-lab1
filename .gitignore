@@ -1,3 +1,11 @@
 penguin-received.gif
 *.o
 .DS_Store
+
+# Ignorar ficheiros binários gerados pelo gcc
+read
+write
+cable
+bin/*
+examples/read
+examples/write

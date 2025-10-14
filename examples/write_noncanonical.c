@@ -35,17 +35,14 @@ int main(int argc, char *argv[])
 {
     if (argc < 2)
     {
-        printf("Incorrect program usage\n"
-               "Usage: %s <SerialPort>\n"
-               "Example: %s /dev/ttyS0\n",
-               argv[0],
-               argv[0]);
+        printf("Incorrect program usage\n");
+        printf("Usage: %s <SerialPort>\n", argv[0]);
+        printf("Example: %s /dev/ttyS0\n", argv[0]);
         exit(1);
     }
 
     // Open serial port device for reading and writing, and not as controlling tty
     // because we don't want to get killed if linenoise sends CTRL-C.
-    //
     // NOTE: See the implementation of the serial port library in "serial_port/".
     const char *serialPort = argv[1];
 
@@ -57,24 +54,66 @@ int main(int argc, char *argv[])
 
     printf("Serial port %s opened\n", serialPort);
 
-    // Create string to send
-    unsigned char buf[BUF_SIZE] = {0};
+    // Create and send a SET frame according to the protocol
+    // Frame: { FLAG, A_SENDER, C_SET, BCC, FLAG }
+    // FLAG = 0x7E, A_SENDER = 0x03, C_SET = 0x03, BCC = 0x03 ^ 0x03 = 0x00
+    unsigned char setFrame[5];
+    setFrame[0] = 0x7E; // FLAG
+    setFrame[1] = 0x03; // A_SENDER
+    setFrame[2] = 0x03; // C_SET
+    setFrame[3] = 0x03 ^ 0x03; // BCC
+    setFrame[4] = 0x7E; // FLAG
 
-    for (int i = 0; i < BUF_SIZE; i++)
+    int bytes = writeBytesSerialPort(setFrame, 5);
+    printf("SET frame sent (%d bytes): ", bytes);
+    for (int i = 0; i < 5; i++)
+        printf("0x%02X ", setFrame[i]);
+    printf("\n");
+
+
+    // Wait and read UA frame from the receiver
+    unsigned char uaFrame[5];
+    int bytesRead = 0;
+    printf("Waiting for UA frame...\n");
+    while (bytesRead < 5)
     {
-        buf[i] = 'a' + i % 26;
+        unsigned char byte;
+        int result = readByteSerialPort(&byte);
+        if (result == 1)
+        {
+            uaFrame[bytesRead++] = byte;
+            printf("UA Byte %d received: 0x%02X\n", bytesRead, byte);
+        }
+        else if (result == 0)
+        {
+            continue;
+        }
+        else if (result == -1)
+        {
+            perror("Error reading UA frame");
+            closeSerialPort();
+            exit(1);
+        }
     }
 
-    // In non-canonical mode, '\n' does not end the writing.
-    // Test this condition by placing a '\n' in the middle of the buffer.
-    // The whole buffer must be sent even with the '\n'.
-    buf[5] = '\n';
-
-    int bytes = writeBytesSerialPort(buf, BUF_SIZE);
-    printf("%d bytes written to serial port\n", bytes);
-
-    // Wait until all bytes have been written to the serial port
-    sleep(1);
+    // Validate UA frame: {0x7E, 0x01, 0x07, 0x01 ^ 0x07, 0x7E}
+    unsigned char expectedUA[5] = {0x7E, 0x01, 0x07, 0x01 ^ 0x07, 0x7E};
+    int valid = 1;
+    for (int i = 0; i < 5; i++) {
+        if (uaFrame[i] != expectedUA[i])
+        {
+            valid = 0;
+            break;
+        }
+    }
+    if (valid) {
+        printf("UA frame received and validated successfully!\n");
+    } else {
+        printf("Invalid UA frame received: ");
+        for (int i = 0; i < 5; i++)
+            printf("0x%02X ", uaFrame[i]);
+        printf("\n");
+    }
 
     // Close serial port
     if (closeSerialPort() < 0)
