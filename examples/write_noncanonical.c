@@ -2,6 +2,7 @@
 //
 // Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
 
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
+#include "alarm_sigaction.h"
 
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
@@ -54,9 +56,13 @@ int main(int argc, char *argv[])
 
     printf("Serial port %s opened\n", serialPort);
 
-    // Create and send a SET frame according to the protocol
-    // Frame: { FLAG, A_SENDER, C_SET, BCC, FLAG }
-    // FLAG = 0x7E, A_SENDER = 0x03, C_SET = 0x03, BCC = 0x03 ^ 0x03 = 0x00
+
+    // Setup alarm handler for retransmission
+    setupAlarmHandler();
+    int maxTries = 3;
+    int tries = 0;
+    int gotUA = FALSE;
+
     unsigned char setFrame[5];
     setFrame[0] = 0x7E; // FLAG
     setFrame[1] = 0x03; // A_SENDER
@@ -64,55 +70,65 @@ int main(int argc, char *argv[])
     setFrame[3] = 0x03 ^ 0x03; // BCC
     setFrame[4] = 0x7E; // FLAG
 
-    int bytes = writeBytesSerialPort(setFrame, 5);
-    printf("SET frame sent (%d bytes): ", bytes);
-    for (int i = 0; i < 5; i++)
-        printf("0x%02X ", setFrame[i]);
-    printf("\n");
-
-
-    // Wait and read UA frame from the receiver
-    unsigned char uaFrame[5];
-    int bytesRead = 0;
-    printf("Waiting for UA frame...\n");
-    while (bytesRead < 5)
-    {
-        unsigned char byte;
-        int result = readByteSerialPort(&byte);
-        if (result == 1)
-        {
-            uaFrame[bytesRead++] = byte;
-            printf("UA Byte %d received: 0x%02X\n", bytesRead, byte);
-        }
-        else if (result == 0)
-        {
-            continue;
-        }
-        else if (result == -1)
-        {
-            perror("Error reading UA frame");
-            closeSerialPort();
-            exit(1);
-        }
-    }
-
-    // Validate UA frame: {0x7E, 0x01, 0x07, 0x01 ^ 0x07, 0x7E}
     unsigned char expectedUA[5] = {0x7E, 0x01, 0x07, 0x01 ^ 0x07, 0x7E};
-    int valid = 1;
-    for (int i = 0; i < 5; i++) {
-        if (uaFrame[i] != expectedUA[i])
-        {
-            valid = 0;
-            break;
-        }
-    }
-    if (valid) {
-        printf("UA frame received and validated successfully!\n");
-    } else {
-        printf("Invalid UA frame received: ");
+
+    while (tries < maxTries && !gotUA) {
+        int bytes = writeBytesSerialPort(setFrame, 5);
+        printf("SET frame sent (%d bytes): ", bytes);
         for (int i = 0; i < 5; i++)
-            printf("0x%02X ", uaFrame[i]);
+            printf("0x%02X ", setFrame[i]);
         printf("\n");
+
+        alarmCount = 0;
+        startAlarm(3); // 3 seconds timeout
+        printf("Waiting for UA frame... (try %d)\n", tries + 1);
+
+        unsigned char uaFrame[5];
+        int bytesRead = 0;
+        while (bytesRead < 5 && alarmEnabled) {
+            unsigned char byte;
+            int result = readByteSerialPort(&byte);
+            if (result == 1) {
+                uaFrame[bytesRead++] = byte;
+                printf("UA Byte %d received: 0x%02X\n", bytesRead, byte);
+            } else if (result == 0) {
+                continue;
+            } else if (result == -1) {
+                perror("Error reading UA frame");
+                closeSerialPort();
+                exit(1);
+            }
+        }
+
+        if (bytesRead == 5) {
+            int valid = 1;
+            for (int i = 0; i < 5; i++) {
+                if (uaFrame[i] != expectedUA[i]) {
+                    valid = 0;
+                    break;
+                }
+            }
+            if (valid) {
+                gotUA = TRUE;
+                cancelAlarm();
+                printf("UA frame received and validated successfully!\n");
+            } else {
+                printf("Invalid UA frame received: ");
+                for (int i = 0; i < 5; i++)
+                    printf("0x%02X ", uaFrame[i]);
+                printf("\n");
+            }
+        } else {
+            // Timeout occurred
+            printf("Timeout waiting for UA frame. Retransmitting...\n");
+        }
+        tries++;
+    }
+
+    if (!gotUA) {
+        printf("Failed to receive valid UA frame after %d attempts. Aborting.\n", maxTries);
+        closeSerialPort();
+        exit(1);
     }
 
     // Close serial port

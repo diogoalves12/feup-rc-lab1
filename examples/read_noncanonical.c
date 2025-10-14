@@ -2,6 +2,7 @@
 //
 // Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
 
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
+#include "alarm_sigaction.h"
 
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
@@ -60,22 +62,24 @@ int main(int argc, char *argv[])
         exit(-1);
     }
 
+
     printf("Serial port %s opened\n", serialPort);
 
-    // Read from serial port until the 'z' char is received.
-
-    // NOTE: This while() cycle is a simple example showing how to read from the serial port.
-    // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
+    setupAlarmHandler();
 
     int nBytesBuf = 0;
-    while (STOP == FALSE)
+    int maxTimeouts = 3;
+    int timeouts = 0;
+    while (STOP == FALSE && timeouts < maxTimeouts)
     {
         unsigned char buffer[FRAME_SIZE];
         int bytesRead = 0;
 
         printf("Waiting for SET frame...\n");
+        alarmCount = 0;
+        startAlarm(3); // 3 seconds to receive SET frame
 
-        while (bytesRead < FRAME_SIZE)
+        while (bytesRead < FRAME_SIZE && alarmEnabled)
         {
             unsigned char byte;
             int result = readByteSerialPort(&byte);
@@ -96,24 +100,46 @@ int main(int argc, char *argv[])
             }
         }
 
-        unsigned char UA[FRAME_SIZE] = {FLAG, A_RECEIVER, C_UA, A_RECEIVER ^ C_UA, FLAG};
-
-        if (writeBytesSerialPort(UA, FRAME_SIZE) != FRAME_SIZE)
-        {
-            perror("Failed to send UA frame");
-            closeSerialPort();
-            exit(1);
+        if (!alarmEnabled && bytesRead < FRAME_SIZE) {
+            // Timeout occurred
+            printf("Timeout waiting for SET frame. Attempt %d/%d\n", timeouts+1, maxTimeouts);
+            timeouts++;
+            continue;
         }
 
-        printf("UA frame sent:\n");
-        for (int i = 0; i < FRAME_SIZE; i++)
-        {
-            printf("0x%02X ", UA[i]);
-        }
-        printf("\n");
+        cancelAlarm();
 
-        // For this example, terminate after one iteration
-        STOP = TRUE;
+        // Validate SET frame: FLAG, A_SENDER, C_SET, BCC, FLAG
+        int validSET = 1;
+        if (buffer[0] != FLAG || buffer[1] != A_SENDER || buffer[2] != C_SET ||
+            buffer[3] != (A_SENDER ^ C_SET) || buffer[4] != FLAG) {
+            validSET = 0;
+        }
+
+        if (validSET) {
+            unsigned char UA[FRAME_SIZE] = {FLAG, A_RECEIVER, C_UA, A_RECEIVER ^ C_UA, FLAG};
+            if (writeBytesSerialPort(UA, FRAME_SIZE) != FRAME_SIZE)
+            {
+                perror("Failed to send UA frame");
+                closeSerialPort();
+                exit(1);
+            }
+            printf("UA frame sent:\n");
+            for (int i = 0; i < FRAME_SIZE; i++)
+            {
+                printf("0x%02X ", UA[i]);
+            }
+            printf("\n");
+            STOP = TRUE;
+        } else {
+            printf("Invalid SET frame received. Ignoring and waiting for a valid one.\n");
+        }
+    }
+
+    if (timeouts == maxTimeouts) {
+        printf("Error: No valid SET frame received after %d timeouts. Exiting.\n", maxTimeouts);
+        closeSerialPort();
+        exit(1);
     }
 
     // Close serial port
