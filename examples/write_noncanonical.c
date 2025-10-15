@@ -85,12 +85,19 @@ int main(int argc, char *argv[])
 
         unsigned char uaFrame[5];
         int bytesRead = 0;
-        while (bytesRead < 5 && alarmEnabled) {
+        int byteRead = FALSE;
+        while (bytesRead < 5 && (alarmEnabled || bytesRead)) { 
+            if(!alarmEnabled) { 
+                if(!byteRead) break;
+                byteRead = FALSE;
+                startAlarm(3);
+            }
             unsigned char byte;
             int result = readByteSerialPort(&byte);
             if (result == 1) {
                 uaFrame[bytesRead++] = byte;
                 printf("UA Byte %d received: 0x%02X\n", bytesRead, byte);
+                byteRead = TRUE;
             } else if (result == 0) {
                 continue;
             } else if (result == -1) {
@@ -259,3 +266,113 @@ int writeBytesSerialPort(const unsigned char *bytes, int nBytes)
 {
     return write(fd, bytes, nBytes);
 }
+
+
+/*
+FLAG [HEADER DATA FOOTER] FLAG
+HEADER:
+    ADRRESS
+    CONTROL
+    BCC1 = ADDRESS XOR CONTROL
+DATA:
+    N bytes
+FOOTER:
+    BCC2 = XOR of all data bytes
+
+Sizes:
+    Header: 3 bytes
+    Data: N bytes
+    Footer: if N > 0, 1 byte
+            else 0 bytes
+
+            
+SUPERVISION
+FLAG [HEADER] FLAG
+
+CONTROL:
+    SET
+    UA
+    DISC
+    RR: 0/1
+    REJ: 0/1
+
+    
+INFORMATION
+FLAG [HEADER DATA FOOTER] FLAG
+
+CONTROL:
+    0x80, 1 << 7
+    0x00, 0 << 7
+
+0x20 0x75 0x40 FLAG 0x03 0x80 0x82 0x20 0x50 BCC2 FLAG FLAG 0x03 0x03 0x00 FLAG
+
+State machine:
+Initial state: wait for FLAG: Ignore all bytes until FLAG is received.
+Header state: After FLAG is received. Read 3 bytes, first is ADDRESS, second is CONTROL, third is BCC1.
+Data state: after header read until flag. dataBuffer[0..N-1], dataSize = N. If flag received && N > 0, BCC2 = dataBuffer[N-1], dataSize--.
+End state: After FLAG is received. Return
+
+
+XOR:
+x^0 = x
+x^x = 0
+y^x^x = y
+
+bcc2 ^ BCC2 ^ BCC2 = bcc2
+----------------------------------------------------------------------------------------------------------
+
+function (unsigned char *header, unsigned char *data, int *dataSize, unsigned char *BCC2){
+    int bcc2 = 0;
+    int byteRead = FALSE;
+    int headerIndex = 0;
+    while(state != END && (alarmEnabled || state != INITIAL)){ 
+        if(!alarmEnabled) { 
+            if(!byteRead) break;
+            byteRead = FALSE;
+            startAlarm(3);
+        }
+        unsigned char byte;
+        int result = readByteSerialPort(&byte);
+        if(!result) continue;
+        if(result == -1) error;
+        byteRead = TRUE;
+        switch(state){
+            case INITIAL:
+                if(byte == FLAG) state = HEADER;
+                break;
+            case HEADER:
+                header[headerIndex++] = byte;
+                if(headerIndex == 3) state = DATA;
+                break;
+
+            case DATA:
+                if(byte == FLAG) {
+                    if(*dataSize > 0) {
+                        *BCC2 = dataBuffer[(*dataSize)-1];
+                        bcc2 ^= dataBuffer[(*dataSize)-1];
+                        (*dataSize)--;
+                    }
+                    state = END;
+                    break;
+                }
+
+                dataBuffer[(*dataSize)++] = byte;
+                bcc2 ^= byte;
+                break;
+            case END:
+                return x;
+        }
+    }
+}
+
+------------------------------------------------------------------------------------------
+Bit stufffing:
+Escape byte: 0x7D
+FLAG: 0x7E
+FLAG after stuffing: 0x7D 0x5E
+Escape after stuffing: 0x7D 0x5D
+
+Flag -> \Flag
+Escape -> \Escape
+
+*/

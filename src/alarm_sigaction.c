@@ -8,6 +8,7 @@ int alarmCount = 0;
 
 void alarmHandler(int signal)
 {
+    if (!alarmEnabled) return;
     alarmEnabled = FALSE;
     alarmCount++;
     printf("Alarm #%d received\n", alarmCount);
