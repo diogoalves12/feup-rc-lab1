@@ -2,7 +2,6 @@
 //
 // Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
 
-
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +10,6 @@
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
-#include "alarm_sigaction.h"
 
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
@@ -37,9 +35,11 @@ int main(int argc, char *argv[])
 {
     if (argc < 2)
     {
-        printf("Incorrect program usage\n");
-        printf("Usage: %s <SerialPort>\n", argv[0]);
-        printf("Example: %s /dev/ttyS0\n", argv[0]);
+        printf("Incorrect program usage\n"
+               "Usage: %s <SerialPort>\n"
+               "Example: %s /dev/ttyS0\n",
+               argv[0],
+               argv[0]);
         exit(1);
     }
 
@@ -56,87 +56,24 @@ int main(int argc, char *argv[])
 
     printf("Serial port %s opened\n", serialPort);
 
+    // Create string to send
+    unsigned char buf[BUF_SIZE] = {0};
 
-    // Setup alarm handler for retransmission
-    setupAlarmHandler();
-    int maxTries = 3;
-    int tries = 0;
-    int gotUA = FALSE;
-
-    unsigned char setFrame[5];
-    setFrame[0] = 0x7E; // FLAG
-    setFrame[1] = 0x03; // A_SENDER
-    setFrame[2] = 0x03; // C_SET
-    setFrame[3] = 0x03 ^ 0x03; // BCC
-    setFrame[4] = 0x7E; // FLAG
-
-    unsigned char expectedUA[5] = {0x7E, 0x01, 0x07, 0x01 ^ 0x07, 0x7E};
-
-    while (tries < maxTries && !gotUA) {
-        int bytes = writeBytesSerialPort(setFrame, 5);
-        printf("SET frame sent (%d bytes): ", bytes);
-        for (int i = 0; i < 5; i++)
-            printf("0x%02X ", setFrame[i]);
-        printf("\n");
-
-        alarmCount = 0;
-        startAlarm(3); // 3 seconds timeout
-        printf("Waiting for UA frame... (try %d)\n", tries + 1);
-
-        unsigned char uaFrame[5];
-        int bytesRead = 0;
-        int byteRead = FALSE;
-        while (bytesRead < 5 && (alarmEnabled || bytesRead)) { 
-            if(!alarmEnabled) { 
-                if(!byteRead) break;
-                byteRead = FALSE;
-                startAlarm(3);
-            }
-            unsigned char byte;
-            int result = readByteSerialPort(&byte);
-            if (result == 1) {
-                uaFrame[bytesRead++] = byte;
-                printf("UA Byte %d received: 0x%02X\n", bytesRead, byte);
-                byteRead = TRUE;
-            } else if (result == 0) {
-                continue;
-            } else if (result == -1) {
-                perror("Error reading UA frame");
-                closeSerialPort();
-                exit(1);
-            }
-        }
-
-        if (bytesRead == 5) {
-            int valid = 1;
-            for (int i = 0; i < 5; i++) {
-                if (uaFrame[i] != expectedUA[i]) {
-                    valid = 0;
-                    break;
-                }
-            }
-            if (valid) {
-                gotUA = TRUE;
-                cancelAlarm();
-                printf("UA frame received and validated successfully!\n");
-            } else {
-                printf("Invalid UA frame received: ");
-                for (int i = 0; i < 5; i++)
-                    printf("0x%02X ", uaFrame[i]);
-                printf("\n");
-            }
-        } else {
-            // Timeout occurred
-            printf("Timeout waiting for UA frame. Retransmitting...\n");
-        }
-        tries++;
+    for (int i = 0; i < BUF_SIZE; i++)
+    {
+        buf[i] = 'a' + i % 26;
     }
 
-    if (!gotUA) {
-        printf("Failed to receive valid UA frame after %d attempts. Aborting.\n", maxTries);
-        closeSerialPort();
-        exit(1);
-    }
+    // In non-canonical mode, '\n' does not end the writing.
+    // Test this condition by placing a '\n' in the middle of the buffer.
+    // The whole buffer must be sent even with the '\n'.
+    buf[5] = '\n';
+
+    int bytes = writeBytesSerialPort(buf, BUF_SIZE);
+    printf("%d bytes written to serial port\n", bytes);
+
+    // Wait until all bytes have been written to the serial port
+    sleep(1);
 
     // Close serial port
     if (closeSerialPort() < 0)

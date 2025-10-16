@@ -68,7 +68,7 @@ int main(int argc, char *argv[])
     setupAlarmHandler();
 
     int nBytesBuf = 0;
-    int maxTimeouts = 3;
+    int maxTimeouts = 3;git 
     int timeouts = 0;
     while (STOP == FALSE && timeouts < maxTimeouts)
     {
@@ -130,6 +130,7 @@ int main(int argc, char *argv[])
                 printf("0x%02X ", UA[i]);
             }
             printf("\n");
+            nBytesBuf += bytesRead;
             STOP = TRUE;
         } else {
             printf("Invalid SET frame received. Ignoring and waiting for a valid one.\n");
