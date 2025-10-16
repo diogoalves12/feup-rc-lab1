@@ -1,4 +1,4 @@
-#include "frame_sm.h"
+#include "state_machine.h"
 #include "alarm_sigaction.h"
 #include "serial_port.h"
 
@@ -11,7 +11,7 @@ typedef enum {
     END,
 } State;
 
-int readFrame(unsigned char *header, unsigned char *data, int *dataSize, int expectedA, int expectedC) {
+int readFrame(unsigned char *header, unsigned char *data, int *dataSize, unsigned char expectedA, unsigned char expectedC) {
     State state = INITIAL;
     int bcc2 = 0;
     int byteRead = FALSE;
@@ -50,7 +50,7 @@ int readFrame(unsigned char *header, unsigned char *data, int *dataSize, int exp
                 if (header[2] != (A ^ C) || A != expectedA || C != expectedC) {
                     state = INITIAL;
                     headerIndex = 0;
-                } else {
+                } else { 
                     state = DATA;
                     bcc2 = 0;
                     *dataSize = 0;
