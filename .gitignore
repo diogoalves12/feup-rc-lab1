@@ -1,6 +1,7 @@
 penguin-received.gif
 *.o
 .DS_Store
+.vscode
 
 # Ignorar ficheiros binários gerados pelo gcc
 read
