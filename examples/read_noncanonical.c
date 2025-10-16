@@ -68,7 +68,7 @@ int main(int argc, char *argv[])
     setupAlarmHandler();
 
     int nBytesBuf = 0;
-    int maxTimeouts = 3;git 
+    int maxTimeouts = 3;
     int timeouts = 0;
     while (STOP == FALSE && timeouts < maxTimeouts)
     {
