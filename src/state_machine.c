@@ -13,9 +13,12 @@ typedef enum {
 
 int readFrame(unsigned char *header, unsigned char *data, int *dataSize, unsigned char expectedA, unsigned char expectedC) {
     State state = INITIAL;
-    int bcc2 = 0;
+    startAlarm(3);
+    unsigned char bcc2 = 0;
+    unsigned char bcc1 = 0;
     int byteRead = FALSE;
     int headerIndex = 0;
+    unsigned char lastByte = 0;
     unsigned char A, C;
     *dataSize = 0;
     
@@ -47,30 +50,20 @@ int readFrame(unsigned char *header, unsigned char *data, int *dataSize, unsigne
             if(headerIndex == 3) {
                 A = header[0];
                 C = header[1];
-                if (header[2] != (A ^ C) || A != expectedA || C != expectedC) {
-                    state = INITIAL;
-                    headerIndex = 0;
-                } else { 
-                    state = DATA;
-                    bcc2 = 0;
-                    *dataSize = 0;
-                }
+                bcc1 = header[2];
+                state = DATA;
+                bcc2 = 0;
+                *dataSize = 0;
             }
             break;
         case DATA:
             if(byte == FLAG) {
                 if(*dataSize > 0) {
-                    unsigned char lastByte = data[(*dataSize) - 1];
+                    lastByte = data[(*dataSize) - 1];
                     bcc2 ^= lastByte;
-                    (*dataSize)--;
-                    if(bcc2 == lastByte) {
-                        state = END;
-                    } else {
-                        state = INITIAL;
-                    }
-                } else {
-                    state = END;
+                    --(*dataSize);
                 }
+                state = END;
                 break;
             }
             data[(*dataSize)++] = byte;
@@ -81,6 +74,15 @@ int readFrame(unsigned char *header, unsigned char *data, int *dataSize, unsigne
             break;
         }
     }
+
+    // verificar control (se tem data ou se nao tem)
+    if(bcc1 != (A ^ C) || bcc2 != lastByte || (false) || (false)) {
+        return -1;
+    }
+    if(expectedA == A || expectedC == C) return 1;
+    return 0;
+
+
     return state == END ? 0 : -1;
 }
 
