@@ -1,88 +1,110 @@
 #include "state_machine.h"
-#include "alarm_sigaction.h"
 #include "serial_port.h"
 
 #define FLAG 0x7E
+#define ESC  0x7D
+#define ESC_XOR 0x20
 
-typedef enum {
-    INITIAL,
-    HEADER,
-    DATA,
-    END,
-} State;
+typedef enum { START, FLAG_RCV, A_RCV, C_RCV, BCC1_OK, DATA_RCV, STOP } State;
 
-int readFrame(unsigned char *header, unsigned char *data, int *dataSize, unsigned char expectedA, unsigned char expectedC) {
-    State state = INITIAL;
-    startAlarm(3);
+// Reads a frame from the serial port.
+// returns -1 on read/bcc1 error, 1 on BCC2 error, 0 on success.
+int readFrame(unsigned char *header, unsigned char *data, int *dataSize) {
+    State state = START;
+
+    unsigned char A = 0, C = 0, bcc1 = 0;
+
     unsigned char bcc2 = 0;
-    unsigned char bcc1 = 0;
-    int byteRead = FALSE;
-    int headerIndex = 0;
-    unsigned char lastByte = 0;
-    unsigned char A, C;
+    unsigned char calcBCC1 = 0, calcBCC2 = 0;
     *dataSize = 0;
-    
-    while(state != END && (alarmEnabled || state != INITIAL)) {
-        if(!alarmEnabled) {
-            if(!byteRead) break;
-            byteRead = FALSE;
-            startAlarm(3);
-        }
-        unsigned char byte;
-        int result = readByteSerialPort(&byte);
-        if(!result) continue;
-        if(result == -1) return -1;
 
-        byteRead = TRUE;
+    int escapeNext = 0;
+    unsigned char byte;
+    int result;
+
+    while(state != STOP) {
+        result = readByteSerialPort(&byte); // readByteSerialPort returns -1 on error, 0 if no byte was received, 1 if a byte was received.
+        if(result == -1) return -1;
+        if(result == 0) continue;
+
         switch (state) {
-        case INITIAL:
-            if (byte == FLAG) {
-                state = HEADER;
-                headerIndex = 0;
+        case START:
+            if(byte == FLAG) state = FLAG_RCV;
+            break;
+
+        case FLAG_RCV:
+            if(byte == FLAG) break; // multiple FLAGs received
+            A = byte;
+            state = A_RCV;
+            break;
+
+        case A_RCV: 
+            if(byte == FLAG) {state = FLAG_RCV; break;} 
+            C = byte;
+            state = C_RCV; 
+            break;
+
+        case C_RCV:
+            if(byte == FLAG) {state = FLAG_RCV; break;}
+            bcc1 = byte;
+            calcBCC1 = (A ^ C);
+            state = BCC1_OK;
+            break;
+
+        case BCC1_OK:
+            if(byte == FLAG) {
+                // Supervion Frame
+                header[0] = A; header[1] = C; header[2] = bcc1;
+                state = STOP;
+            } else {
+                if(byte == ESC) {
+                    escapeNext = 1;
+                } else {
+                // Information Frame
+                unsigned char actualByte = escapeNext ? (byte ^ ESC_XOR) : byte;
+                escapeNext = 0;
+                data[(*dataSize)++] = actualByte;
+                calcBCC2 ^= actualByte;
+                }
+                state = DATA_RCV;
             }
             break;
-        case HEADER:
-            if (byte == FLAG) { 
-                headerIndex = 0;
-                break;
-            }
-            header[headerIndex++] = byte;
-            if(headerIndex == 3) {
-                A = header[0];
-                C = header[1];
-                bcc1 = header[2];
-                state = DATA;
-                bcc2 = 0;
-                *dataSize = 0;
-            }
-            break;
-        case DATA:
+
+        case DATA_RCV:
             if(byte == FLAG) {
                 if(*dataSize > 0) {
-                    lastByte = data[(*dataSize) - 1];
-                    bcc2 ^= lastByte;
+                    bcc2 = data[(*dataSize) - 1];
+                    calcBCC2 ^= bcc2; // removes bcc2 from data
                     --(*dataSize);
                 }
-                state = END;
+                header[0] = A; header[1] = C; header[2] = bcc1;
+                escapeNext = 0;
+                state = STOP;
                 break;
             }
-            data[(*dataSize)++] = byte;
-            bcc2 ^= byte;
+
+            if(byte == ESC) {
+                escapeNext = 1;
+            } else {
+                unsigned char actualByte = escapeNext ? (byte ^ ESC_XOR) : byte;
+                escapeNext = 0;
+                data[(*dataSize)++] = actualByte;
+                calcBCC2 ^= actualByte;
+            }
             break;
-        case END:
+
+        case STOP:
+            break;            
         default:
             break;
         }
     }
 
-    // verificar control (se tem data ou se nao tem)
-    if(bcc1 != (A ^ C) || bcc2 != lastByte || (false) || (false)) {
-        return -1;
+    if(bcc1 != calcBCC1) return -1; // bcc1 verification error
+
+    if(*dataSize > 0) {
+        if (calcBCC2 != bcc2) return 1; // bcc2 verification error
     }
-    if(expectedA == A || expectedC == C) return 1;
-    return 0;
 
-
-    return state == END ? 0 : -1;
+    return 0; // success
 }
-
