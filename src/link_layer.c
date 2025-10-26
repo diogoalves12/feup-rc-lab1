@@ -303,7 +303,89 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 int llclose()
 {
-    // TODO: Implement this function
+    unsigned char header[3];
+    unsigned char dataBuf[MAX_PAYLOAD_SIZE];
+    int dataSize = 0;
 
-    return 0;
+    if(role == LlTx) {
+        int tries = 0;
+
+        while(tries < maxRetries) {
+            if(sendSupervisionFrame(A_TX, C_DISC) < 0) {
+                closeSerialPort();
+                return -1;
+            }
+
+            // Wait for DISC from receiver
+            startAlarm(timeout);
+            while(alarmEnabled) {
+                int r = readFrame(header, dataBuf, &dataSize); 
+                if(r == 0) {
+                    if(checkHeader(header,A_TX,C_DISC)) {
+                        // DISC received -> send UA and close
+                        cancelAlarm();
+                        // Send UA and close
+                        if(sendSupervisionFrame(A_TX,C_UA) < 0) {
+                            closeSerialPort();
+                            return -1;
+                        }
+                        closeSerialPort();
+                        return 0;
+                    }
+                }
+                else if (r < 0 || r == 1) {
+                    // read/bcc1 error or BCC2 error: ignore until timeout 
+                }
+            }
+            cancelAlarm();
+            tries++;
+        }
+        closeSerialPort();
+        return -1; // exceeded max tries
+    } 
+    
+    else if (role == LlRx) {
+        // 1) wait for DISC from peer (no timer; may block until received)
+        while(TRUE) {
+            int r = readFrame(header, dataBuf, &dataSize);
+            if(r == 0 && checkHeader(header,A_TX,C_DISC)){
+                break;
+            }
+        // else ignore and continue
+        }
+
+        // 2) Send DISC and wait for UA
+        int tries = 0;
+        while(tries < maxRetries) {
+            if(sendSupervisionFrame(A_TX,C_DISC) < 0) {
+                closeSerialPort();
+                return -1;
+            }
+
+            startAlarm(timeout);
+            while(alarmEnabled) {
+                int r = readFrame(header, dataBuf, &dataSize);
+                if(r == 0) {
+                    if(checkHeader(header,A_TX,C_UA)) {
+                        // UA received -> close
+                        cancelAlarm();
+                        closeSerialPort();
+                        return 0;
+                    }
+                }
+                else if (r < 0 || r == 1) {
+                    // read/bcc1 error or BCC2 error: ignore until timeout 
+                }
+            }
+            cancelAlarm();
+            tries++;
+        }
+
+        closeSerialPort();
+        return -1; // exceeded max tries
+    }
+
+    // invalid state
+    closeSerialPort();
+    return -1;
 }
