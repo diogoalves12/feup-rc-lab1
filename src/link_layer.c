@@ -4,17 +4,67 @@
 #include "serial_port.h"
 #include "alarm_sigaction.h"
 #include "state_machine.h"
+#include <string.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
+// Frame constants
 #define FLAG 0x7E
 #define ESCAPE 0x7D
+#define ESC_XOR 0x20
+
+// Address field
 #define A_TX 0x03 // Address field in frames that are commands sent by the Transmitter or replies sent by the Receiver
 #define A_RX 0x01 // Address field in frames that are commands sent by the Receiver or replies sent by the Transmitter
+
+// Control field 
 #define C_SET 0x03
 #define C_UA 0x07
 #define C_DISC 0x0B
+
+// Control field helpers
+#define C_I(ns)   ((unsigned char)((ns) ? 0x80 : 0x00))
+#define C_RR(r)   ((unsigned char)((r) ? 0xAB : 0xAA))
+#define C_REJ(r)  ((unsigned char)((r) ? 0x55 : 0x54))
+
+// Link-layer internal state 
+static LinkLayerRole role;      // LLTx or LLRx
+static int timeout = 0;         // Timeout seconds
+static int maxRetries = 0;      // Max retransmissions
+static int nsTx = 0;           // Transmitter sequence number (Ns)
+static int nrRX = 0;           // Receiver expected Ns
+
+/////////////////////////////////////////////////
+// Helper functions
+/////////////////////////////////////////////////
+
+// Writes the full buffer to the serial port, handling partial writes.
+static int writeAll(const unsigned char *buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int w = writeBytesSerialPort(buf + total, len - total);
+        if (w < 0) return -1;
+        total += w;
+    }
+    return total;
+}
+
+// Byte-stuff a single byte into out buffer, returns bytes written (1 or 2)
+static int stuffByte(unsigned char b, unsigned char *out) {
+    if (b == FLAG || b == ESCAPE) {
+        out[0] = ESCAPE;
+        out[1] = (unsigned char)(b ^ ESC_XOR);
+        return 2;
+    }
+    out[0] = b;
+    return 1;
+}
+
+// Verificação de header (A, C, BCC1)
+static int checkHeader(const unsigned char header[3], unsigned char a, unsigned char c) {
+    return header[0] == a && header[1] == c && header[2] == (unsigned char)(a ^ c);
+}
 
 static void buildSupervisionFrame(unsigned char a, unsigned char c, unsigned char frame[5]) {
     frame[0] = FLAG;
@@ -25,34 +75,39 @@ static void buildSupervisionFrame(unsigned char a, unsigned char c, unsigned cha
 }
 
 static int sendSupervisionFrame(unsigned char a, unsigned char c) {
-    unsigned char f[5];
-    buildSupervisionFrame(a, c, f);
-    int w = writeBytesSerialPort(f, 5);
-    return (w == 5) ? 0 : -1;
+    unsigned char frame[5];
+    buildSupervisionFrame(a, c, frame);
+    // int w = writeBytesSerialPort(f, 5);
+    //return (w == 5) ? 0 : -1;
+    return(writeAll(frame, 5) == 5) ? 0 : -1;
 }
 
-// Verificação de header (A, C, BCC1)
-static int checkHeader(const unsigned char header[3], unsigned char a, unsigned char c) {
-    return header[0] == a && header[1] == c && header[2] == (unsigned char)(a ^ c);
-}
+// Build an I-frame into outFrame with payload buf[0..bufSize-1].
+// Returns total frame length in outLen; returns 0 on error (e.g., too big)
+static int buildIFrame(const unsigned char *buf, int bufSize, int ns, unsigned char *outFrame, int outLen) {
+    // Worst-case stuffing: each data byte (and BCC2) becomes 2 bytes
+    int maxNeeded = 1 + 1 + 1 + 1 + (bufSize * 2) + 2 + 1; // FLAG + A + C + BCC1 + DATA + BCC2 + FLAG
+    if (outLen < maxNeeded) return 0;
 
-// not used yet
-static int waitForSupervision(unsigned char expectedA, unsigned char expectedC) {
-    unsigned char header[3];
-    unsigned char dataBuf[MAX_PAYLOAD_SIZE];
-    int dataSize = 0;
+    int i = 0;
+    outFrame[i++] = FLAG;
+    outFrame[i++] = A_TX;
 
-    while (alarmEnabled) {
-        int r = readFrame(header, dataBuf, &dataSize);
-        if (r == 0) {
-            if (checkHeader(header, expectedA, expectedC)) return 0;
-        } else if (r < 0) {
-            // erro/BCC1: ignora até timeout
-        }
+    unsigned char c = C_I(ns);
+    outFrame[i++] = c;
+    outFrame[i++] = (unsigned char)(A_TX ^ c);
+
+    unsigned char bcc2 = 0;
+    for (int k = 0; k < bufSize; ++k) {
+        bcc2 ^= buf[k];
+        i += stuffByte(buf[k], &outFrame[i]);
     }
-    return -1; // timeout
-}
 
+    i += stuffByte(bcc2, &outFrame[i]);
+    outFrame[i++] = FLAG;
+    
+    return i;
+}
 
 
 ////////////////////////////////////////////////
@@ -88,6 +143,12 @@ int llopen(LinkLayer connectionParameters)
                     if(checkHeader(header, A_TX, C_UA)) {
                         // UA received
                         cancelAlarm();
+                        // Initialize internal state for subsequent operations
+                        role = LlTx;
+                        timeout = connectionParameters.timeout;
+                        maxRetries = connectionParameters.nRetransmissions;
+                        nsTx = 0;
+                        nrRX = 0;
                         return 0;
                     }
                 } else if (res < 0) {
@@ -112,6 +173,12 @@ int llopen(LinkLayer connectionParameters)
                         closeSerialPort();
                         return -1;
                     }
+                    // Initialize internal state for subsequent operations
+                    role = LlRx;
+                    timeout = connectionParameters.timeout;
+                    maxRetries = connectionParameters.nRetransmissions;
+                    nsTx = 0;
+                    nrRX = 0;
                     return 0; // Ligação estabelecida
                 }
             } else if (res < 0) {
@@ -128,9 +195,62 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
 
-    return 0;
+    if (role != LlTx) return -1;
+    if (bufSize < 0 || bufSize > MAX_PAYLOAD_SIZE) return -1;
+
+    // build Iframe
+    unsigned char frame[bufSize * 2 + 7]; 
+    int frameLen = buildIFrame(buf, bufSize, nsTx, frame, (int)sizeof(frame));
+    if(frameLen <= 0) return -1;
+
+    int tries = 0;
+    while(tries < maxRetries) { 
+        // send Iframe
+        int w = writeAll(frame, frameLen);
+        if(w != frameLen) return -1;
+        
+        // wait for RR/REJ
+        startAlarm(timeout);
+
+        unsigned char header[3];
+        unsigned char dataBuf[MAX_PAYLOAD_SIZE];
+        int dataSize = 0;
+
+        while (alarmEnabled) {
+            int r = readFrame(header, dataBuf, &dataSize);
+            if (r == 0) {
+                // Supervision expected: RR or REJ from receiver uses A_TX
+                unsigned char rrExpected = C_RR((nsTx ^ 1)); // se ns = 0 então espera RR(1), se ns = 1 então espera RR(0)
+                if (checkHeader(header, A_TX, rrExpected)) {
+                    cancelAlarm();
+                    nsTx ^= 1; // toggle ns for next frame -> se nsTx = 0 então nsTx = 1, se nsTx = 1 então nsTx = 0
+                    return bufSize;
+                }
+
+                unsigned char rejExpected = C_REJ(nsTx);    
+                if (checkHeader(header, A_TX, rejExpected)) {
+                    // Explicit rejection: retransmit immediately without consuming a timeout
+                    cancelAlarm();
+                    break; // break inner wait to resend
+                }
+                // Ignore other frames (SET/UA/DISC)
+            } else if (r < 0) {
+                // read/bcc1 error: ignore until timeout
+            } else if (r == 1) {
+                // BCC2 error on an unexpected info frame: ignore; we only expect supervision
+            }
+        }
+        // Timeout path: prepare retransmission
+        cancelAlarm();
+        tries++;
+        // Rebuild frame with same Ns
+        frameLen = buildIFrame(buf, bufSize, nsTx, frame, (int)sizeof(frame));
+        if (frameLen <= 0) return -1;
+    }
+
+    // Exceeded retries
+    return -1;
 }
 
 ////////////////////////////////////////////////
@@ -138,9 +258,44 @@ int llwrite(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {
-    // TODO: Implement this function
+    if (role != LlRx) return -1;
 
-    return 0;
+    unsigned char header[3];
+    // +1 to hold BCC2 temporarily; readFrame appends BCC2 then removes it
+    unsigned char dataBuf[MAX_PAYLOAD_SIZE + 1];
+    int dataSize = 0;
+
+    while (TRUE) {
+        int r = readFrame(header, dataBuf, &dataSize);
+        if (r == 0) {
+            // Supervision or Information frame received with valid BCC1 (and BCC2 if data)
+            if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
+                // Information frame
+                int ns = (header[1] & 0x80) ? 1 : 0;
+                if (ns == nrRX) {
+                    // Correct in-order frame: send RR(next) and deliver payload
+                    if (sendSupervisionFrame(A_TX, C_RR(nrRX ^ 1)) < 0) return -1;
+                    if (dataSize > 0)
+                        memcpy(packet, dataBuf, dataSize);
+                    nrRX ^= 1;
+                    return dataSize;
+                } else {
+                    // Duplicate frame: already delivered; re-ACK current expected
+                    if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
+                    continue; // keep waiting for the expected Ns
+                }
+            }
+            // Other supervision frames are ignored here (handled in llopen/llclose)
+        } else if (r == 1) {
+            // BCC2 error on Information frame: request retransmission
+            if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
+                if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
+            }
+            // then keep waiting
+        } else { // r < 0
+            // Read error or BCC1 error: ignore and continue
+        }
+    }
 }
 
 ////////////////////////////////////////////////
