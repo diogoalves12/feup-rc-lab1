@@ -6,7 +6,6 @@
 #include "state_machine.h"
 #include <string.h>
 #include <time.h>
-#include <sys/time.h>
 #include <stdio.h>
 
 // MISC
@@ -38,30 +37,7 @@ static int maxRetries = 0;      // Max retransmissions
 static int nsTx = 0;           // Transmitter sequence number (Ns)
 static int nrRX = 0;           // Receiver expected Ns
 
-/////////////////////////////////////////////////
-// Debug / timing helpers
-/////////////////////////////////////////////////
-
-#ifndef LL_DEBUG
-#define LL_DEBUG 1
-#endif
-
-static int ll_debug_enabled = LL_DEBUG;
-static unsigned long long now_ms(void)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (unsigned long long)tv.tv_sec * 1000ULL + (unsigned long long)tv.tv_usec / 1000ULL;
-}
-
-
-#define DLOG(fmt, ...) do { \
-    if (ll_debug_enabled) { \
-        printf("[LL][%llu ms] " fmt "\n", now_ms(), ##__VA_ARGS__); \
-    } \
-} while (0)
-
-// Runtime stats (simple counters)
+// Runtime stats
 static unsigned long stat_tx_iframes = 0;
 static unsigned long stat_rx_iframes = 0;
 static unsigned long stat_rej_sent = 0;
@@ -72,7 +48,12 @@ static unsigned long stat_timeouts = 0;
 // Helper functions
 /////////////////////////////////////////////////
 
-// Writes the full buffer to the serial port, handling partial writes.
+/**
+ * Writes the full buffer to the serial port, handling partial writes.
+ * @param buf Pointer to the bytes to transmit.
+ * @param len Number of bytes to write.
+ * @return Total bytes written, or -1 if the writeBytesSerialPort fails.
+ */
 static int writeAll(const unsigned char *buf, int len) {
     int total = 0;
     while (total < len) {
@@ -83,7 +64,12 @@ static int writeAll(const unsigned char *buf, int len) {
     return total;
 }
 
-// Byte-stuff a single byte into out buffer, returns bytes written (1 or 2)
+/**
+ * Applies byte stuffing to a byte.
+ * @param b Byte to stuff.
+ * @param out Output buffer where the stuffed byte(s) are written.
+ * @return Number of bytes produced (1 for normal data, 2 if escaped).
+ */
 static int stuffByte(unsigned char b, unsigned char *out) {
     if (b == FLAG || b == ESCAPE) {
         out[0] = ESCAPE;
@@ -94,11 +80,23 @@ static int stuffByte(unsigned char b, unsigned char *out) {
     return 1;
 }
 
-// Verificação de header (A, C, BCC1)
+/**
+ * Checks whether the header matches the expected address, control and BCC1.
+ * @param header Header bytes [A, C, BCC1].
+ * @param a Expected address field.
+ * @param c Expected control field.
+ * @return TRUE when the header is valid, FALSE otherwise.
+ */
 static int checkHeader(const unsigned char header[3], unsigned char a, unsigned char c) {
     return header[0] == a && header[1] == c && header[2] == (unsigned char)(a ^ c);
 }
 
+/**
+ * Builds a supervision frame.
+ * @param a Address field.
+ * @param c Control field.
+ * @param frame Output buffer (frame) (5 bytes).
+ */
 static void buildSupervisionFrame(unsigned char a, unsigned char c, unsigned char frame[5]) {
     frame[0] = FLAG;
     frame[1] = a;
@@ -107,6 +105,12 @@ static void buildSupervisionFrame(unsigned char a, unsigned char c, unsigned cha
     frame[4] = FLAG;
 }
 
+/**
+ * Sends a supervision frame.
+ * @param a Address field.
+ * @param c Control field.
+ * @return 0 on success, -1 on write error.
+ */
 static int sendSupervisionFrame(unsigned char a, unsigned char c) {
     unsigned char frame[5];
     buildSupervisionFrame(a, c, frame);
@@ -115,8 +119,15 @@ static int sendSupervisionFrame(unsigned char a, unsigned char c) {
     return(writeAll(frame, 5) == 5) ? 0 : -1;
 }
 
-// Build an I-frame into outFrame with payload buf[0..bufSize-1].
-// Returns total frame length in outLen; returns 0 on error (e.g., too big)
+/**
+ * Builds an information frame with stuffed payload bytes.
+ * @param buf Payload data to stuff.
+ * @param bufSize Number of payload bytes.
+ * @param ns Sequence number bit (0/1) to use in the control field.
+ * @param outFrame Destination buffer for the stuffed frame.
+ * @param outLen Capacity of the destination buffer.
+ * @return Frame length on success, 0 when the buffer is insufficient.
+ */
 static int buildIFrame(const unsigned char *buf, int bufSize, int ns, unsigned char *outFrame, int outLen) {
     // Worst-case stuffing: each data byte (and BCC2) becomes 2 bytes
     int maxNeeded = 1 + 1 + 1 + 1 + (bufSize * 2) + 2 + 1; // FLAG + A + C + BCC1 + DATA + BCC2 + FLAG
@@ -142,10 +153,16 @@ static int buildIFrame(const unsigned char *buf, int bufSize, int ns, unsigned c
     return i;
 }
 
-
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
+
+/**
+ * Opens the link-layer connection performing the SET/UA.
+ * Initializes timeouts, retry counters, sequence numbers.
+ * @param connectionParameters Configuration provided by the application layer.
+ * @return 0 on success, -1 on error.
+ */
 int llopen(LinkLayer connectionParameters)
 {
 
@@ -155,12 +172,6 @@ int llopen(LinkLayer connectionParameters)
 
     setupAlarmHandler();
 
-    DLOG("llopen: role=%s baud=%d timeout=%d retries=%d",
-         (connectionParameters.role == LlTx ? "Tx" : "Rx"),
-         connectionParameters.baudRate,
-         connectionParameters.timeout,
-         connectionParameters.nRetransmissions);
-
     unsigned char header[3];
     unsigned char dataBuf[ MAX_PAYLOAD_SIZE];
     int dataSize = 0;
@@ -169,14 +180,12 @@ int llopen(LinkLayer connectionParameters)
         int tries = 0;
 
         while(tries < connectionParameters.nRetransmissions) {
-            DLOG("llopen[Tx]: send SET (try %d)", tries + 1);
             if(sendSupervisionFrame(A_TX, C_SET) < 0) {
                 closeSerialPort();
                 return -1;
             }
 
             startAlarm(connectionParameters.timeout);
-            unsigned long long t0 = now_ms();
             
             while(alarmEnabled) {
                 int res = readFrame(header, dataBuf, &dataSize);
@@ -184,8 +193,7 @@ int llopen(LinkLayer connectionParameters)
                     if(checkHeader(header, A_TX, C_UA)) {
                         // UA received
                         cancelAlarm();
-                        DLOG("llopen[Tx]: got UA after %llums", now_ms() - t0);
-                        // Initialize internal state for subsequent operations
+                        // Initialize role, timeouts, retries, sequence numbers
                         role = LlTx;
                         timeout = connectionParameters.timeout;
                         maxRetries = connectionParameters.nRetransmissions;
@@ -198,7 +206,6 @@ int llopen(LinkLayer connectionParameters)
                 }
             }
             cancelAlarm();
-            DLOG("llopen[Tx]: timeout waiting UA (try %d)", tries + 1);
             tries++;
         }
         // exceeded max tries
@@ -212,7 +219,6 @@ int llopen(LinkLayer connectionParameters)
             if(res == 0) {
                 // readFrame já verificou BCC1; aqui basta confirmar comando
                 if(checkHeader(header, A_TX , C_SET)) {
-                    DLOG("llopen[Rx]: received SET -> send UA");
                     if (sendSupervisionFrame(A_TX, C_UA) < 0) {
                         closeSerialPort();
                         return -1;
@@ -237,6 +243,14 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 // LLWRITE
 ////////////////////////////////////////////////
+
+/**
+ * Sends a I-frame using stop-and-wait.
+ * Handles retransmissions on timeouts or REJ responses.
+ * @param buf data payload to send.
+ * @param bufSize Number of payload bytes to send.
+ * @return Bytes accepted by the receiver, or -1 on error.
+ */
 int llwrite(const unsigned char *buf, int bufSize)
 {
 
@@ -254,11 +268,9 @@ int llwrite(const unsigned char *buf, int bufSize)
         int w = writeAll(frame, frameLen);
         if(w != frameLen) return -1;
         stat_tx_iframes++;
-        DLOG("llwrite: sent I(ns=%d) len=%d (try %d)", nsTx, frameLen, tries + 1);
-        
+
         // wait for RR/REJ
         startAlarm(timeout);
-        unsigned long long t0 = now_ms();
 
         unsigned char header[3];
         unsigned char dataBuf[MAX_PAYLOAD_SIZE];
@@ -274,7 +286,6 @@ int llwrite(const unsigned char *buf, int bufSize)
                 if (checkHeader(header, A_TX, rrExpected)) {
                     cancelAlarm();
                     nsTx ^= 1; // toggle ns for next frame -> se nsTx = 0 então nsTx = 1, se nsTx = 1 então nsTx = 0
-                    DLOG("llwrite: got RR, next Ns=%d after %llums", nsTx, now_ms() - t0);
                     return bufSize;
                 }
 
@@ -284,7 +295,6 @@ int llwrite(const unsigned char *buf, int bufSize)
                     cancelAlarm();
                     gotRej = 1;
                     stat_rej_recv++;
-                    DLOG("llwrite: got REJ(ns=%d) after %llums", nsTx, now_ms() - t0);
                     break; // break inner wait to resend
                 }
                 // Ignore other frames (SET/UA/DISC)
@@ -302,7 +312,6 @@ int llwrite(const unsigned char *buf, int bufSize)
         // Timeout path: prepare retransmission
         cancelAlarm();  
         stat_timeouts++;
-        DLOG("llwrite: timeout waiting RR/REJ (try %d)", tries + 1);
         tries++;
         // Rebuild frame with same Ns
         frameLen = buildIFrame(buf, bufSize, nsTx, frame, (int)sizeof(frame));
@@ -316,6 +325,12 @@ int llwrite(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
+
+/**
+ * Receives the next information frame.
+ * @param packet Buffer where the delivered payload will be stored.
+ * @return Number of bytes copied into packet, or -1 on error.
+ */
 int llread(unsigned char *packet)
 {
     if (role != LlRx) return -1;
@@ -339,12 +354,10 @@ int llread(unsigned char *packet)
                         memcpy(packet, dataBuf, dataSize);
                     nrRX ^= 1;
                     stat_rx_iframes++;
-                    DLOG("llread: accepted I(ns=%d), sent RR(next=%d), data=%d", ns, nrRX, dataSize);
                     return dataSize;
                 } else {
                     // Duplicate frame: already delivered; re-ACK current expected
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
-                    DLOG("llread: duplicate I(ns=%d), re-sent RR(curr=%d)", ns, nrRX);
                     continue; // keep waiting for the expected Ns
                 }
             }
@@ -356,11 +369,9 @@ int llread(unsigned char *packet)
                 if(ns == nrRX) {
                      if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
                     stat_rej_sent++;
-                    DLOG("llread: BCC2 error on I(expected ns=%d) -> sent REJ", nrRX);  
                 } else {
                     // Duplicate frame with BCC2 error: re-ACK current expected
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
-                    DLOG("llread: BCC2 error on duplicate I(ns=%d) -> re-sent RR(curr=%d)", ns, nrRX);
                 }
             }
             // then keep waiting
@@ -374,9 +385,13 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
+
+/**
+ * Closes the link-layer connection following the DISC/UA.
+ * @return 0 on success, -1 if all retries are used.
+ */
 int llclose()
 {
-    DLOG("llclose: start");
     unsigned char header[3];
     unsigned char dataBuf[MAX_PAYLOAD_SIZE];
     int dataSize = 0;
@@ -385,7 +400,6 @@ int llclose()
         int tries = 0;
 
         while(tries < maxRetries) {
-            DLOG("llclose[Tx]: send DISC (try %d)", tries + 1);
             if(sendSupervisionFrame(A_TX, C_DISC) < 0) {
                 closeSerialPort();
                 return -1;
@@ -396,17 +410,15 @@ int llclose()
             while(alarmEnabled) {
                 int r = readFrame(header, dataBuf, &dataSize); 
                 if(r == 0) {
-                    if(checkHeader(header,A_TX,C_DISC)) {
+                    if(checkHeader(header,A_RX,C_DISC)) {
                         // DISC received -> send UA and close
                         cancelAlarm();
                         // Send UA and close
-                        if(sendSupervisionFrame(A_TX,C_UA) < 0) {
+                        if(sendSupervisionFrame(A_RX,C_UA) < 0) {
                             closeSerialPort();
                             return -1;
                         }
                         closeSerialPort();
-                        DLOG("llclose[Tx]: closed. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
-                             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
                         return 0;
                     }
                 }
@@ -415,18 +427,14 @@ int llclose()
                 }
             }
             cancelAlarm();
-            DLOG("llclose[Tx]: timeout waiting DISC (try %d)", tries + 1);
             tries++;
         }
         closeSerialPort();
-        DLOG("llclose[Tx]: exceeded retries. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
-             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
         return -1; // exceeded max tries
     } 
     
     else if (role == LlRx) {
         // 1) wait for DISC from peer (no timer; may block until received)
-        DLOG("llclose[Rx]: waiting DISC");
         while(TRUE) {
             int r = readFrame(header, dataBuf, &dataSize);
             if(r == 0 && checkHeader(header,A_TX,C_DISC)){
@@ -438,8 +446,7 @@ int llclose()
         // 2) Send DISC and wait for UA
         int tries = 0;
         while(tries < maxRetries) {
-            DLOG("llclose[Rx]: send DISC (try %d)", tries + 1);
-            if(sendSupervisionFrame(A_TX,C_DISC) < 0) {
+            if(sendSupervisionFrame(A_RX,C_DISC) < 0) {
                 closeSerialPort();
                 return -1;
             }
@@ -448,12 +455,10 @@ int llclose()
             while(alarmEnabled) {
                 int r = readFrame(header, dataBuf, &dataSize);
                 if(r == 0) {
-                    if(checkHeader(header,A_TX,C_UA)) {
+                    if(checkHeader(header,A_RX,C_UA)) {
                         // UA received -> close
                         cancelAlarm();
                         closeSerialPort();
-                        DLOG("llclose[Rx]: closed. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
-                             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
                         return 0;
                     }
                 }
@@ -462,13 +467,10 @@ int llclose()
                 }
             }
             cancelAlarm();
-            DLOG("llclose[Rx]: timeout waiting UA (try %d)", tries + 1);
             tries++;
         }
 
         closeSerialPort();
-        DLOG("llclose[Rx]: exceeded retries. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
-             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
         return -1; // exceeded max tries
     }
 
