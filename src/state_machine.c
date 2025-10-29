@@ -1,3 +1,8 @@
+/**
+ * @file state_machine.c
+ * @brief Link-layer frame reception state machine implementation.
+ */
+
 #include "state_machine.h"
 #include "serial_port.h"
 
@@ -5,10 +10,25 @@
 #define ESC  0x7D
 #define ESC_XOR 0x20
 
+/**
+ * @brief State machine stages used by @ref readFrame.
+ */
 typedef enum { START, FLAG_RCV, A_RCV, C_RCV, BCC1_OK, DATA_RCV, STOP } State;
 
-// Reads a frame from the serial port.
-// returns -1 on read/bcc1 error, 1 on BCC2 error, 0 on success.
+/**
+ * @brief Reads a single frame from the serial port, and does byte destuffing.
+ *
+ * The state machine parses the A/C/BCC1 header, destuffs the payload,
+ * verifies both bytes BCC1/BCC2, and returns the payload (without BCC2).
+ *
+ * @param[out] header Buffer where the header (A, C, BCC1) is stored.
+ * @param[out] data Buffer that receives the destuffed payload bytes.
+ * @param[out] dataSize Number of payload bytes written intodata.
+ *
+ * @retval 0 Frame received successfully with valid BCCs.
+ * @retval -1 Read error or header validiation (BCC1) error.
+ * @retval 1 data validation (BCC2) error after destuffing.
+ */
 int readFrame(unsigned char *header, unsigned char *data, int *dataSize) {
     State state = START;
 

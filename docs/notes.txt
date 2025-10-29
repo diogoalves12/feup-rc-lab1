@@ -33,6 +33,8 @@ FLAG [HEADER DATA FOOTER] FLAG
 CONTROL:
     0x80, 1 << 7
     0x00, 0 << 7
+    
+I, SET and DISC are commands  the rest (UA, RR and REJ) are called Replies.
 
 0x20 0x75 0x40 FLAG 0x03 0x80 0x82 0x20 0x50 BCC2 FLAG FLAG 0x03 0x03 0x00 FLAG
 
