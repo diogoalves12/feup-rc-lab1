@@ -5,6 +5,9 @@
 #include "alarm_sigaction.h"
 #include "state_machine.h"
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <stdio.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
@@ -34,6 +37,36 @@ static int timeout = 0;         // Timeout seconds
 static int maxRetries = 0;      // Max retransmissions
 static int nsTx = 0;           // Transmitter sequence number (Ns)
 static int nrRX = 0;           // Receiver expected Ns
+
+/////////////////////////////////////////////////
+// Debug / timing helpers
+/////////////////////////////////////////////////
+
+#ifndef LL_DEBUG
+#define LL_DEBUG 1
+#endif
+
+static int ll_debug_enabled = LL_DEBUG;
+static unsigned long long now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (unsigned long long)tv.tv_sec * 1000ULL + (unsigned long long)tv.tv_usec / 1000ULL;
+}
+
+
+#define DLOG(fmt, ...) do { \
+    if (ll_debug_enabled) { \
+        printf("[LL][%llu ms] " fmt "\n", now_ms(), ##__VA_ARGS__); \
+    } \
+} while (0)
+
+// Runtime stats (simple counters)
+static unsigned long stat_tx_iframes = 0;
+static unsigned long stat_rx_iframes = 0;
+static unsigned long stat_rej_sent = 0;
+static unsigned long stat_rej_recv = 0;
+static unsigned long stat_timeouts = 0;
 
 /////////////////////////////////////////////////
 // Helper functions
@@ -122,6 +155,12 @@ int llopen(LinkLayer connectionParameters)
 
     setupAlarmHandler();
 
+    DLOG("llopen: role=%s baud=%d timeout=%d retries=%d",
+         (connectionParameters.role == LlTx ? "Tx" : "Rx"),
+         connectionParameters.baudRate,
+         connectionParameters.timeout,
+         connectionParameters.nRetransmissions);
+
     unsigned char header[3];
     unsigned char dataBuf[ MAX_PAYLOAD_SIZE];
     int dataSize = 0;
@@ -130,12 +169,14 @@ int llopen(LinkLayer connectionParameters)
         int tries = 0;
 
         while(tries < connectionParameters.nRetransmissions) {
+            DLOG("llopen[Tx]: send SET (try %d)", tries + 1);
             if(sendSupervisionFrame(A_TX, C_SET) < 0) {
                 closeSerialPort();
                 return -1;
             }
 
             startAlarm(connectionParameters.timeout);
+            unsigned long long t0 = now_ms();
             
             while(alarmEnabled) {
                 int res = readFrame(header, dataBuf, &dataSize);
@@ -143,6 +184,7 @@ int llopen(LinkLayer connectionParameters)
                     if(checkHeader(header, A_TX, C_UA)) {
                         // UA received
                         cancelAlarm();
+                        DLOG("llopen[Tx]: got UA after %llums", now_ms() - t0);
                         // Initialize internal state for subsequent operations
                         role = LlTx;
                         timeout = connectionParameters.timeout;
@@ -156,6 +198,7 @@ int llopen(LinkLayer connectionParameters)
                 }
             }
             cancelAlarm();
+            DLOG("llopen[Tx]: timeout waiting UA (try %d)", tries + 1);
             tries++;
         }
         // exceeded max tries
@@ -169,6 +212,7 @@ int llopen(LinkLayer connectionParameters)
             if(res == 0) {
                 // readFrame já verificou BCC1; aqui basta confirmar comando
                 if(checkHeader(header, A_TX , C_SET)) {
+                    DLOG("llopen[Rx]: received SET -> send UA");
                     if (sendSupervisionFrame(A_TX, C_UA) < 0) {
                         closeSerialPort();
                         return -1;
@@ -209,13 +253,18 @@ int llwrite(const unsigned char *buf, int bufSize)
         // send Iframe
         int w = writeAll(frame, frameLen);
         if(w != frameLen) return -1;
+        stat_tx_iframes++;
+        DLOG("llwrite: sent I(ns=%d) len=%d (try %d)", nsTx, frameLen, tries + 1);
         
         // wait for RR/REJ
         startAlarm(timeout);
+        unsigned long long t0 = now_ms();
 
         unsigned char header[3];
         unsigned char dataBuf[MAX_PAYLOAD_SIZE];
         int dataSize = 0;
+
+        int gotRej = 0;
 
         while (alarmEnabled) {
             int r = readFrame(header, dataBuf, &dataSize);
@@ -225,6 +274,7 @@ int llwrite(const unsigned char *buf, int bufSize)
                 if (checkHeader(header, A_TX, rrExpected)) {
                     cancelAlarm();
                     nsTx ^= 1; // toggle ns for next frame -> se nsTx = 0 então nsTx = 1, se nsTx = 1 então nsTx = 0
+                    DLOG("llwrite: got RR, next Ns=%d after %llums", nsTx, now_ms() - t0);
                     return bufSize;
                 }
 
@@ -232,6 +282,9 @@ int llwrite(const unsigned char *buf, int bufSize)
                 if (checkHeader(header, A_TX, rejExpected)) {
                     // Explicit rejection: retransmit immediately without consuming a timeout
                     cancelAlarm();
+                    gotRej = 1;
+                    stat_rej_recv++;
+                    DLOG("llwrite: got REJ(ns=%d) after %llums", nsTx, now_ms() - t0);
                     break; // break inner wait to resend
                 }
                 // Ignore other frames (SET/UA/DISC)
@@ -241,8 +294,15 @@ int llwrite(const unsigned char *buf, int bufSize)
                 // BCC2 error on an unexpected info frame: ignore; we only expect supervision
             }
         }
+
+        if(gotRej) {
+            // Retransmission due to REJ
+            continue; // resend immediately
+        } 
         // Timeout path: prepare retransmission
-        cancelAlarm();
+        cancelAlarm();  
+        stat_timeouts++;
+        DLOG("llwrite: timeout waiting RR/REJ (try %d)", tries + 1);
         tries++;
         // Rebuild frame with same Ns
         frameLen = buildIFrame(buf, bufSize, nsTx, frame, (int)sizeof(frame));
@@ -272,16 +332,19 @@ int llread(unsigned char *packet)
             if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
                 // Information frame
                 int ns = (header[1] & 0x80) ? 1 : 0;
-                if (ns == nrRX) {
+                if(ns == nrRX) {
                     // Correct in-order frame: send RR(next) and deliver payload
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX ^ 1)) < 0) return -1;
                     if (dataSize > 0)
                         memcpy(packet, dataBuf, dataSize);
                     nrRX ^= 1;
+                    stat_rx_iframes++;
+                    DLOG("llread: accepted I(ns=%d), sent RR(next=%d), data=%d", ns, nrRX, dataSize);
                     return dataSize;
                 } else {
                     // Duplicate frame: already delivered; re-ACK current expected
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
+                    DLOG("llread: duplicate I(ns=%d), re-sent RR(curr=%d)", ns, nrRX);
                     continue; // keep waiting for the expected Ns
                 }
             }
@@ -289,9 +352,19 @@ int llread(unsigned char *packet)
         } else if (r == 1) {
             // BCC2 error on Information frame: request retransmission
             if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
-                if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
+                int ns = (header[1] & 0x80) ? 1 : 0;
+                if(ns == nrRX) {
+                     if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
+                    stat_rej_sent++;
+                    DLOG("llread: BCC2 error on I(expected ns=%d) -> sent REJ", nrRX);  
+                } else {
+                    // Duplicate frame with BCC2 error: re-ACK current expected
+                    if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
+                    DLOG("llread: BCC2 error on duplicate I(ns=%d) -> re-sent RR(curr=%d)", ns, nrRX);
+                }
             }
             // then keep waiting
+            continue;
         } else { // r < 0
             // Read error or BCC1 error: ignore and continue
         }
@@ -303,6 +376,7 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 int llclose()
 {
+    DLOG("llclose: start");
     unsigned char header[3];
     unsigned char dataBuf[MAX_PAYLOAD_SIZE];
     int dataSize = 0;
@@ -311,6 +385,7 @@ int llclose()
         int tries = 0;
 
         while(tries < maxRetries) {
+            DLOG("llclose[Tx]: send DISC (try %d)", tries + 1);
             if(sendSupervisionFrame(A_TX, C_DISC) < 0) {
                 closeSerialPort();
                 return -1;
@@ -330,6 +405,8 @@ int llclose()
                             return -1;
                         }
                         closeSerialPort();
+                        DLOG("llclose[Tx]: closed. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
+                             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
                         return 0;
                     }
                 }
@@ -338,14 +415,18 @@ int llclose()
                 }
             }
             cancelAlarm();
+            DLOG("llclose[Tx]: timeout waiting DISC (try %d)", tries + 1);
             tries++;
         }
         closeSerialPort();
+        DLOG("llclose[Tx]: exceeded retries. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
+             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
         return -1; // exceeded max tries
     } 
     
     else if (role == LlRx) {
         // 1) wait for DISC from peer (no timer; may block until received)
+        DLOG("llclose[Rx]: waiting DISC");
         while(TRUE) {
             int r = readFrame(header, dataBuf, &dataSize);
             if(r == 0 && checkHeader(header,A_TX,C_DISC)){
@@ -357,6 +438,7 @@ int llclose()
         // 2) Send DISC and wait for UA
         int tries = 0;
         while(tries < maxRetries) {
+            DLOG("llclose[Rx]: send DISC (try %d)", tries + 1);
             if(sendSupervisionFrame(A_TX,C_DISC) < 0) {
                 closeSerialPort();
                 return -1;
@@ -370,6 +452,8 @@ int llclose()
                         // UA received -> close
                         cancelAlarm();
                         closeSerialPort();
+                        DLOG("llclose[Rx]: closed. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
+                             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
                         return 0;
                     }
                 }
@@ -378,10 +462,13 @@ int llclose()
                 }
             }
             cancelAlarm();
+            DLOG("llclose[Rx]: timeout waiting UA (try %d)", tries + 1);
             tries++;
         }
 
         closeSerialPort();
+        DLOG("llclose[Rx]: exceeded retries. Stats tx=%lu rx=%lu rej_sent=%lu rej_recv=%lu timeouts=%lu",
+             stat_tx_iframes, stat_rx_iframes, stat_rej_sent, stat_rej_recv, stat_timeouts);
         return -1; // exceeded max tries
     }
 
