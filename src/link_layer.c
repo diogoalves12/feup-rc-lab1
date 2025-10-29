@@ -114,9 +114,8 @@ static void buildSupervisionFrame(unsigned char a, unsigned char c, unsigned cha
 static int sendSupervisionFrame(unsigned char a, unsigned char c) {
     unsigned char frame[5];
     buildSupervisionFrame(a, c, frame);
-    // int w = writeBytesSerialPort(f, 5);
-    //return (w == 5) ? 0 : -1;
-    return(writeAll(frame, 5) == 5) ? 0 : -1;
+    // use writeAll to ensure full write, partial writes should not happen.
+    return(writeAll(frame, 5) == 5) ? 0 : -1; 
 }
 
 /**
@@ -129,7 +128,7 @@ static int sendSupervisionFrame(unsigned char a, unsigned char c) {
  * @return Frame length on success, 0 when the buffer is insufficient.
  */
 static int buildIFrame(const unsigned char *buf, int bufSize, int ns, unsigned char *outFrame, int outLen) {
-    // Worst-case stuffing: each data byte (and BCC2) becomes 2 bytes
+    // stuffing no pior caso: each data byte (and BCC2) becomes 2 bytes
     int maxNeeded = 1 + 1 + 1 + 1 + (bufSize * 2) + 2 + 1; // FLAG + A + C + BCC1 + DATA + BCC2 + FLAG
     if (outLen < maxNeeded) return 0;
 
@@ -180,18 +179,21 @@ int llopen(LinkLayer connectionParameters)
         int tries = 0;
 
         while(tries < connectionParameters.nRetransmissions) {
+
             if(sendSupervisionFrame(A_TX, C_SET) < 0) {
                 closeSerialPort();
                 return -1;
             }
 
             startAlarm(connectionParameters.timeout);
-            
+
+            // Wait for UA response
             while(alarmEnabled) {
+                // readFrame returns -1 on read/bcc1 error, 1 on BCC2 error, 0 on success.
                 int res = readFrame(header, dataBuf, &dataSize);
                 if(res == 0) {
+                    // valid UA received from receiver
                     if(checkHeader(header, A_TX, C_UA)) {
-                        // UA received
                         cancelAlarm();
                         // Initialize role, timeouts, retries, sequence numbers
                         role = LlTx;
@@ -202,37 +204,41 @@ int llopen(LinkLayer connectionParameters)
                         return 0;
                     }
                 } else if (res < 0) {
-                    // read error, ignores untill timeout
+                    // read error, keeps waiting until timeout
                 }
             }
+            // timeout (alarm fired) 
             cancelAlarm();
             tries++;
         }
-        // exceeded max tries
+        // exceeded max tries without receiving UA
         closeSerialPort();
-        return -1; // exceeded max tries
+        return -1;
     }
 
     else if (connectionParameters.role == LlRx) {
+        // Wait for SET from TX
         while(TRUE) {
+            // readFrame returns -1 on read/bcc1 error, 1 on BCC2 error, 0 on success.
             int res = readFrame(header, dataBuf, &dataSize);
             if(res == 0) {
-                // readFrame já verificou BCC1; aqui basta confirmar comando
+                // Confirmar if we received SET command (BCC1 already checked in readFrame)
                 if(checkHeader(header, A_TX , C_SET)) {
+                    // Send UA response
                     if (sendSupervisionFrame(A_TX, C_UA) < 0) {
                         closeSerialPort();
                         return -1;
                     }
-                    // Initialize internal state for subsequent operations
+                    // Initialize role, timeouts, retries, sequence numbers
                     role = LlRx;
                     timeout = connectionParameters.timeout;
                     maxRetries = connectionParameters.nRetransmissions;
                     nsTx = 0;
                     nrRX = 0;
-                    return 0; // Ligação estabelecida
+                    return 0; // success
                 }
             } else if (res < 0) {
-                // read error, ignore and continue
+                // read error, ignore and continue wating for SET
             }
         }
     }
@@ -264,7 +270,7 @@ int llwrite(const unsigned char *buf, int bufSize)
 
     int tries = 0;
     while(tries < maxRetries) { 
-        // send Iframe
+        // Transmit Iframe to RX
         int w = writeAll(frame, frameLen);
         if(w != frameLen) return -1;
         stat_tx_iframes++;
@@ -281,17 +287,17 @@ int llwrite(const unsigned char *buf, int bufSize)
         while (alarmEnabled) {
             int r = readFrame(header, dataBuf, &dataSize);
             if (r == 0) {
-                // Supervision expected: RR or REJ from receiver uses A_TX
+                // Supervision expected -> RR or REJ from receiver uses A_TX
                 unsigned char rrExpected = C_RR((nsTx ^ 1)); // se ns = 0 então espera RR(1), se ns = 1 então espera RR(0)
                 if (checkHeader(header, A_TX, rrExpected)) {
                     cancelAlarm();
-                    nsTx ^= 1; // toggle ns for next frame -> se nsTx = 0 então nsTx = 1, se nsTx = 1 então nsTx = 0
+                    nsTx ^= 1; // flip ns for next frame -> se nsTx = 0 então nsTx = 1, se nsTx = 1 então nsTx = 0
                     return bufSize;
                 }
 
                 unsigned char rejExpected = C_REJ(nsTx);    
                 if (checkHeader(header, A_TX, rejExpected)) {
-                    // Explicit rejection: retransmit immediately without consuming a timeout
+                    // Got rej -> resend without waiting and consuming a try
                     cancelAlarm();
                     gotRej = 1;
                     stat_rej_recv++;
@@ -301,7 +307,7 @@ int llwrite(const unsigned char *buf, int bufSize)
             } else if (r < 0) {
                 // read/bcc1 error: ignore until timeout
             } else if (r == 1) {
-                // BCC2 error on an unexpected info frame: ignore; we only expect supervision
+                // BCC2 error on an unexpected info frame: ignore, we only expect supervision
             }
         }
 
@@ -336,19 +342,18 @@ int llread(unsigned char *packet)
     if (role != LlRx) return -1;
 
     unsigned char header[3];
-    // +1 to hold BCC2 temporarily; readFrame appends BCC2 then removes it
+    // +1 to hold BCC2 temporarily, readFrame appends BCC2 then removes it
     unsigned char dataBuf[MAX_PAYLOAD_SIZE + 1];
     int dataSize = 0;
 
     while (TRUE) {
         int r = readFrame(header, dataBuf, &dataSize);
         if (r == 0) {
-            // Supervision or Information frame received with valid BCC1 (and BCC2 if data)
+            // Information frame received with valid BCC1 (and BCC2 if data), acepts ns = 0/1
             if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
-                // Information frame
                 int ns = (header[1] & 0x80) ? 1 : 0;
                 if(ns == nrRX) {
-                    // Correct in-order frame: send RR(next) and deliver payload
+                    // Correct order frame -> send flip ns: RR(nr^1), and deliver payload
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX ^ 1)) < 0) return -1;
                     if (dataSize > 0)
                         memcpy(packet, dataBuf, dataSize);
@@ -356,30 +361,29 @@ int llread(unsigned char *packet)
                     stat_rx_iframes++;
                     return dataSize;
                 } else {
-                    // Duplicate frame: already delivered; re-ACK current expected
+                    // Duplicate frame, same ns -> already delivered; re-acknowledge current expected
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
                     continue; // keep waiting for the expected Ns
                 }
             }
-            // Other supervision frames are ignored here (handled in llopen/llclose)
         } else if (r == 1) {
-            // BCC2 error on Information frame: request retransmission
+            // BCC2 error on Information frame -> request retransmission
             if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
                 int ns = (header[1] & 0x80) ? 1 : 0;
                 if(ns == nrRX) {
-                     if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
+                    if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
                     stat_rej_sent++;
                 } else {
-                    // Duplicate frame with BCC2 error: re-ACK current expected
+                    // Duplicate frame with BCC2 error -> re-acknowledge current expected
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
                 }
             }
-            // then keep waiting
-            continue;
+            continue; // continue on loop waiting
         } else { // r < 0
             // Read error or BCC1 error: ignore and continue
         }
     }
+    return -1; 
 }
 
 ////////////////////////////////////////////////
@@ -405,7 +409,7 @@ int llclose()
                 return -1;
             }
 
-            // Wait for DISC from receiver
+            // Wait for DISC from RX
             startAlarm(timeout);
             while(alarmEnabled) {
                 int r = readFrame(header, dataBuf, &dataSize); 
@@ -434,16 +438,15 @@ int llclose()
     } 
     
     else if (role == LlRx) {
-        // 1) wait for DISC from peer (no timer; may block until received)
+        // wait for DISC from TX
         while(TRUE) {
             int r = readFrame(header, dataBuf, &dataSize);
             if(r == 0 && checkHeader(header,A_TX,C_DISC)){
                 break;
             }
-        // else ignore and continue
         }
 
-        // 2) Send DISC and wait for UA
+        // Reply (send) DISC and wait for UA
         int tries = 0;
         while(tries < maxRetries) {
             if(sendSupervisionFrame(A_RX,C_DISC) < 0) {
