@@ -1,4 +1,5 @@
-// Application layer protocol implementation using START/DATA/END packets
+// Application layer protocol implementation
+
 #include "application_layer.h"
 #include "link_layer.h"
 
@@ -7,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Application protocol opcodes
+// Application control field
 #define C_DATA  0x01
 #define C_START 0x02
 #define C_END   0x03
@@ -16,16 +17,40 @@
 #define T_FILESIZE 0x00
 #define T_FILENAME 0x01
 
-// DATA payload bytes (rest are header fields)
+// Limits
 #define APP_PAYLOAD_SIZE 996
 
-// Packet helpers ------------------------------------------------------------
+
+/////////////////////////////////////////////////
+// Helper functions
+/////////////////////////////////////////////////
+
+/**
+ * @brief Computes how many bytes are needed to represent a uint64_t in big-endian.
+ * @param value The value to be measured.
+ * @return Number of bytes (>0) required to represent @p value.
+ */
 static unsigned int big_endian_len(uint64_t value) {
     unsigned int n = 1;
     while (value >> (n * 8)) n++;
     return n;
 }
 
+/**
+ * @brief Builds a control packet (C_START or C_END) with the following layout:
+ *        [C][T_FILESIZE][Lsize][size (big-endian, Lsize bytes)]
+ *        [T_FILENAME][Lname][filename (Lname bytes)]
+ *
+ *        The filename length must fit a single-byte TLV length (0..255).
+ *
+ * @param control  C_START or C_END.
+ * @param filename File name to advertise (Lname ∈ [0,255]).
+ * @param filesize File size in bytes.
+ * @param[out] out Output buffer where the packet is written.
+ * @param outCap   Capacity of @p out.
+ *
+ * @return Packet length (>=0) on success, or -1 on error/insufficient capacity.
+ */
 static int build_control_packet(unsigned char control,
                                 const char *filename,
                                 uint64_t filesize,
@@ -33,44 +58,76 @@ static int build_control_packet(unsigned char control,
                                 size_t outCap)
 {
     unsigned int lsize = big_endian_len(filesize);
+
+    // Lname has 1 byte in TLV -> cannot exceed 255
     unsigned int lname = (unsigned int)strlen(filename);
+    if (lname > 255) return -1;
+
+    // Required space: C + (T,L,Size[L]) + (T,L,Name[L])
     size_t needed = 1 + 1 + 1 + lsize + 1 + 1 + lname;
     if (needed > outCap) return -1;
 
     size_t i = 0;
+
+    // C (application opcode)
     out[i++] = control;
+
+    // TLV: FILESIZE
     out[i++] = T_FILESIZE;
     out[i++] = (unsigned char)lsize;
+
+    // Write filesize in big-endian (most significant byte first)
     for (int b = (int)lsize - 1; b >= 0; --b) {
         out[i + b] = (unsigned char)(filesize & 0xFF);
         filesize >>= 8;
     }
     i += lsize;
+
+    // TLV: FILENAME
     out[i++] = T_FILENAME;
     out[i++] = (unsigned char)lname;
     memcpy(&out[i], filename, lname);
     i += lname;
+
     return (int)i;
 }
 
+/**
+ * @brief Parses a control packet (C_START or C_END).
+ *        Extracts the filesize (if present) and the filename (if present).
+ *
+ * @param pkt      Pointer to the received packet bytes.
+ * @param len      Packet length in bytes.
+ * @param[out] filesize  Receives the parsed file size (if present).
+ * @param[out] nameBuf   Buffer to store the parsed file name (NUL-terminated).
+ * @param nameCap  Capacity of @p nameBuf.
+ *
+ * @return 0 on success (filesize found), or -1 on invalid format/error.
+ */
 static int parse_control_packet(const unsigned char *pkt, int len,
                                 uint64_t *filesize, char *nameBuf, size_t nameCap)
 {
+    // At least the C field must be present
     if (len < 1) return -1;
     if (pkt[0] != C_START && pkt[0] != C_END) return -1;
 
-    int i = 1;
-    int foundSize = 0;
+    int i = 1;         // cursor after C
+    int foundSize = 0; // set once T_FILESIZE is parsed
+
+    // Iterate TLVs: [T][L][V...]
     while (i + 2 <= len) {
         unsigned char type = pkt[i++];
-        unsigned char l = pkt[i++];
-        if (i + l > len) return -1;
+        unsigned char l    = pkt[i++];
+        if (i + l > len) return -1; // TLV exceeds packet bounds
+
         if (type == T_FILESIZE) {
+            // Rebuild big-endian value
             uint64_t v = 0;
             for (int b = 0; b < l; ++b) v = (v << 8) | pkt[i + b];
             *filesize = v;
             foundSize = 1;
         } else if (type == T_FILENAME) {
+            // Copy with NUL termination safeguard
             size_t copy = (l < nameCap - 1) ? l : nameCap - 1;
             memcpy(nameBuf, &pkt[i], copy);
             nameBuf[copy] = '\0';
@@ -80,6 +137,19 @@ static int parse_control_packet(const unsigned char *pkt, int len,
     return foundSize ? 0 : -1;
 }
 
+/**
+ * @brief Builds a data packet with layout:
+ *        [C_DATA][SEQ][L1][L2][payload...]
+ *        where L = (L1<<8)|L2 and 0 ≤ L ≤ APP_PAYLOAD_SIZE.
+ *
+ * @param seq        Packet sequence number (0..255).
+ * @param payload    Pointer to the data bytes.
+ * @param payloadLen Number of payload bytes.
+ * @param[out] out   Output buffer where the packet is written.
+ * @param outCap     Capacity of @p out.
+ *
+ * @return Packet length (>=0) on success, or -1 on error.
+ */
 static int build_data_packet(unsigned char seq,
                              const unsigned char *payload,
                              unsigned int payloadLen,
@@ -87,30 +157,49 @@ static int build_data_packet(unsigned char seq,
                              size_t outCap)
 {
     if (payloadLen > APP_PAYLOAD_SIZE) return -1;
+
+    // C + SEQ + L1 + L2 + payload
     size_t need = 4 + payloadLen;
     if (need > outCap) return -1;
+
     out[0] = C_DATA;
     out[1] = seq;
     out[2] = (unsigned char)((payloadLen >> 8) & 0xFF);
     out[3] = (unsigned char)(payloadLen & 0xFF);
     if (payloadLen) memcpy(&out[4], payload, payloadLen);
+
     return (int)need;
 }
 
-// TX path ------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// Transmitter (TX) path
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @brief Transmitter path: sends C_START, a sequence of C_DATA, then C_END.
+ *
+ * @param filename Path to the file to transmit.
+ * @return 0 on success, -1 on I/O or llwrite() failure.
+ */
 static int run_transmitter(const char *filename)
 {
+    // Open source file in binary mode
     FILE *f = fopen(filename, "rb");
     if (!f) { perror("[APP][TX] fopen"); return -1; }
+
+    // Large buffering for efficient I/O (optional)
     setvbuf(f, NULL, _IOFBF, 1 << 20);
 
+    // Determine file size
     if (fseek(f, 0, SEEK_END) != 0) { perror("[APP][TX] fseek"); fclose(f); return -1; }
     long sz = ftell(f);
     if (sz < 0) { perror("[APP][TX] ftell"); fclose(f); return -1; }
     rewind(f);
 
+    // Workspace for building application packets
     unsigned char packet[MAX_PAYLOAD_SIZE];
 
+    // Send START (metadata)
     int ctrlLen = build_control_packet(C_START, filename, (uint64_t)sz,
                                        packet, sizeof(packet));
     if (ctrlLen < 0 || llwrite(packet, ctrlLen) < 0) {
@@ -119,11 +208,15 @@ static int run_transmitter(const char *filename)
         return -1;
     }
 
+    // Send DATA sequence in chunks up to APP_PAYLOAD_SIZE
     unsigned char seq = 0;
     size_t totalSent = 0;
+
     for (;;) {
+        // Read directly into the future payload area of 'packet'
         size_t rd = fread(&packet[4], 1, APP_PAYLOAD_SIZE, f);
-        if (rd == 0) break;
+        if (rd == 0) break; // EOF
+
         int dataLen = build_data_packet(seq, &packet[4], (unsigned int)rd,
                                         packet, sizeof(packet));
         if (dataLen < 0 || llwrite(packet, dataLen) < 0) {
@@ -135,6 +228,7 @@ static int run_transmitter(const char *filename)
         seq = (unsigned char)((seq + 1) & 0xFF);
     }
 
+    // Send END (best-effort even if it fails)
     ctrlLen = build_control_packet(C_END, filename, (uint64_t)sz,
                                    packet, sizeof(packet));
     if (ctrlLen >= 0) (void)llwrite(packet, ctrlLen);
@@ -144,7 +238,17 @@ static int run_transmitter(const char *filename)
     return 0;
 }
 
-// RX path ------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// Receiver (RX) path
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @brief Receiver path: waits for C_START, receives ordered C_DATA packets,
+ *        and finishes on C_END. Writes the received bytes to the output file.
+ *
+ * @param outFilename Path to the destination file.
+ * @return 0 on success, -1 on I/O errors.
+ */
 static int run_receiver(const char *outFilename)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
@@ -152,7 +256,7 @@ static int run_receiver(const char *outFilename)
     uint64_t expectedSize = 0;
     char txName[256] = {0};
 
-    // Wait START
+    // Wait for START
     for (;;) {
         len = llread(packet);
         if (len <= 0) continue;
@@ -165,6 +269,7 @@ static int run_receiver(const char *outFilename)
         }
     }
 
+    // Open output file in binary mode
     FILE *out = fopen(outFilename, "wb");
     if (!out) { perror("[APP][RX] fopen"); return -1; }
     setvbuf(out, NULL, _IOFBF, 1 << 20);
@@ -178,19 +283,31 @@ static int run_receiver(const char *outFilename)
         if (len <= 0) continue;
 
         if (packet[0] == C_DATA) {
+            // Minimum header size is 4 bytes: C / SEQ / L1 / L2
             if (len < 4) continue;
+
             unsigned char seq = packet[1];
             unsigned int payloadLen = ((unsigned int)packet[2] << 8) | packet[3];
+
+            // Guard against malformed lengths
             if (payloadLen > APP_PAYLOAD_SIZE || (int)(4 + payloadLen) > len) continue;
-            if (seq != expectSeq) {
-                // duplicate/out-of-order -> ignore, link layer should prevent this
-                continue;
-            }
+
+            // Duplicate or out-of-order (link layer should prevent, but be safe)
+            if (seq != expectSeq) continue;
+
             size_t wr = fwrite(&packet[4], 1, payloadLen, out);
             if (wr != payloadLen) { perror("[APP][RX] fwrite"); break; }
             written += payloadLen;
             expectSeq = (unsigned char)((expectSeq + 1) & 0xFF);
+
         } else if (packet[0] == C_END) {
+            // Sanity check: total received should match the advertised size
+            if (written != expectedSize) {
+                fprintf(stderr,
+                        "[APP][RX] received size (%llu) != expected size (%llu)\n",
+                        (unsigned long long)written,
+                        (unsigned long long)expectedSize);
+            }
             done = 1;
         }
     }
@@ -200,26 +317,44 @@ static int run_receiver(const char *outFilename)
     return 0;
 }
 
-// Application entry --------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+// Application entry point
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @brief Application layer entry point. Opens the link-layer connection (llopen),
+ *        runs TX or RX according to @p role, and then closes the link (llclose).
+ *
+ * @param serialPort Path to the serial port device.
+ * @param role       "tx" for transmitter, otherwise receiver.
+ * @param baudRate   Serial baud rate (must match link-layer support).
+ * @param nTries     Maximum number of retransmissions at the link layer.
+ * @param timeout    Timeout (seconds) per attempt at the link layer.
+ * @param filename   File path used by the TX (source) or RX (destination).
+ */
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
-    LinkLayer ll = {0};
+    // Initialize link-layer configuration
+    LinkLayer ll = (LinkLayer){0};
     strncpy(ll.serialPort, serialPort, sizeof(ll.serialPort) - 1);
     ll.role = (strcmp(role, "tx") == 0) ? LlTx : LlRx;
     ll.baudRate = baudRate;
     ll.nRetransmissions = nTries;
     ll.timeout = timeout;
 
+    // Open link-layer connection (performs SET/UA handshake)
     printf("[APP] calling llopen (role=%s)\n", role);
     if (llopen(ll) != 0) {
         printf("[APP] llopen FAILED\n");
         return;
     }
 
+    // Run TX or RX path
     int status = (ll.role == LlTx) ? run_transmitter(filename)
                                    : run_receiver(filename);
 
+    // Close link-layer connection (performs DISC/UA)
     printf("[APP] calling llclose\n");
     int cr = llclose();
     printf("[APP] llclose %s\n", (cr == 0) ? "OK" : "FAILED");
