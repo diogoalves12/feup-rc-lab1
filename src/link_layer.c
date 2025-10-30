@@ -179,11 +179,12 @@ int llopen(LinkLayer connectionParameters)
         int tries = 0;
 
         while(tries < connectionParameters.nRetransmissions) {
-
             if(sendSupervisionFrame(A_TX, C_SET) < 0) {
                 closeSerialPort();
+                printf("[llopen] Tx: failed to send SET on attempt %d\n", tries + 1);
                 return -1;
             }
+            printf("[llopen] Tx: sending SET (attempt %d/%d)\n", tries + 1, connectionParameters.nRetransmissions);
 
             startAlarm(connectionParameters.timeout);
 
@@ -196,6 +197,7 @@ int llopen(LinkLayer connectionParameters)
                     if(checkHeader(header, A_TX, C_UA)) {
                         cancelAlarm();
                         // Initialize role, timeouts, retries, sequence numbers
+                        printf("[llopen] Tx: received UA, llopen ok \n");
                         role = LlTx;
                         timeout = connectionParameters.timeout;
                         maxRetries = connectionParameters.nRetransmissions;
@@ -204,7 +206,7 @@ int llopen(LinkLayer connectionParameters)
                         return 0;
                     }
                 } else if (res < 0) {
-                    // read error, keeps waiting until timeout
+                    // read/bcc1 error, keeps waiting until timeout
                 }
             }
             // timeout (alarm fired) 
@@ -212,6 +214,7 @@ int llopen(LinkLayer connectionParameters)
             tries++;
         }
         // exceeded max tries without receiving UA
+        printf("[llopen] Tx: llopen failed after %d attempts\n", connectionParameters.nRetransmissions);
         closeSerialPort();
         return -1;
     }
@@ -227,9 +230,11 @@ int llopen(LinkLayer connectionParameters)
                     // Send UA response
                     if (sendSupervisionFrame(A_TX, C_UA) < 0) {
                         closeSerialPort();
+                        printf("[llopen] Rx: error sending UA reply to SET\n");
                         return -1;
                     }
                     // Initialize role, timeouts, retries, sequence numbers
+                    printf("[llopen] Rx: received SET, sent UA, llopen ok \n");
                     role = LlRx;
                     timeout = connectionParameters.timeout;
                     maxRetries = connectionParameters.nRetransmissions;
@@ -239,6 +244,7 @@ int llopen(LinkLayer connectionParameters)
                 }
             } else if (res < 0) {
                 // read error, ignore and continue wating for SET
+                printf("[llopen] Rx: read error while waiting for SET (ignored)\n");
             }
         }
     }
@@ -271,8 +277,12 @@ int llwrite(const unsigned char *buf, int bufSize)
     int tries = 0;
     while(tries < maxRetries) { 
         // Transmit Iframe to RX
+        printf("[llwrite] Tx: sent I-frame ns=%d len=%d (attempt %d/%d)\n", nsTx, bufSize, tries + 1, maxRetries);
         int w = writeAll(frame, frameLen);
-        if(w != frameLen) return -1;
+        if(w != frameLen) {
+            printf("[llwrite] Tx: write error while sending I-frame (wrote %d/%d)\n", w, frameLen);
+            return -1;
+        }
         stat_tx_iframes++;
 
         // wait for RR/REJ
@@ -292,6 +302,7 @@ int llwrite(const unsigned char *buf, int bufSize)
                 if (checkHeader(header, A_TX, rrExpected)) {
                     cancelAlarm();
                     nsTx ^= 1; // flip ns for next frame -> se nsTx = 0 então nsTx = 1, se nsTx = 1 então nsTx = 0
+                    printf("[llwrite] Tx: received RR, ns = %d\n", nsTx);
                     return bufSize;
                 }
 
@@ -301,6 +312,7 @@ int llwrite(const unsigned char *buf, int bufSize)
                     cancelAlarm();
                     gotRej = 1;
                     stat_rej_recv++;
+                    printf("[llwrite] Tx: received REJ for ns=%d\n", nsTx);
                     break; // break inner wait to resend
                 }
                 // Ignore other frames (SET/UA/DISC)
@@ -313,6 +325,7 @@ int llwrite(const unsigned char *buf, int bufSize)
 
         if(gotRej) {
             // Retransmission due to REJ
+            printf("[llwrite] Tx: retransmitting I-frame ns=%d \n", nsTx);
             continue; // resend immediately
         } 
         // Timeout path: prepare retransmission
@@ -325,6 +338,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     }
 
     // Exceeded retries
+    printf("[llwrite] Tx: max retries reached (%d)\n", maxRetries);
     return -1;
 }
 
@@ -354,6 +368,7 @@ int llread(unsigned char *packet)
                 int ns = (header[1] & 0x80) ? 1 : 0;
                 if(ns == nrRX) {
                     // Correct order frame -> send flip ns: RR(nr^1), and deliver payload
+                    printf("[llread] Rx: received I-frame ns=%d len=%d -> sent RR(%d)\n", ns, dataSize, nrRX ^ 1);
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX ^ 1)) < 0) return -1;
                     if (dataSize > 0)
                         memcpy(packet, dataBuf, dataSize);
@@ -363,6 +378,7 @@ int llread(unsigned char *packet)
                 } else {
                     // Duplicate frame, same ns -> already delivered; re-acknowledge current expected
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
+                    printf("[llread] Rx: duplicate I-frame ns=%d (expecting %d) -> re-send RR\n", ns, nrRX);
                     continue; // keep waiting for the expected Ns
                 }
             }
@@ -371,16 +387,19 @@ int llread(unsigned char *packet)
             if (header[0] == A_TX && (header[1] == C_I(0) || header[1] == C_I(1))) {
                 int ns = (header[1] & 0x80) ? 1 : 0;
                 if(ns == nrRX) {
+                    printf("[llread] Rx: BCC2 error on ns=%d -> sending REJ(%d)\n", ns, nrRX);
                     if (sendSupervisionFrame(A_TX, C_REJ(nrRX)) < 0) return -1;
                     stat_rej_sent++;
                 } else {
                     // Duplicate frame with BCC2 error -> re-acknowledge current expected
+                    printf("[llread] Rx: BCC2 error on duplicate ns=%d, re-sending RR(%d)\n", ns, nrRX);
                     if (sendSupervisionFrame(A_TX, C_RR(nrRX)) < 0) return -1;
                 }
             }
             continue; // continue on loop waiting
         } else { // r < 0
             // Read error or BCC1 error: ignore and continue
+            printf("[llread] Rx: read/BCC1 error while waiting for I-frame\n");
         }
     }
     return -1; 
@@ -404,8 +423,10 @@ int llclose()
         int tries = 0;
 
         while(tries < maxRetries) {
+            printf("[llclose] Tx: sending DISC (attempt %d/%d)\n", tries + 1, maxRetries);
             if(sendSupervisionFrame(A_TX, C_DISC) < 0) {
                 closeSerialPort();
+                printf("[llclose] Tx: failed to send DISC on attempt %d\n", tries + 1);
                 return -1;
             }
 
@@ -418,39 +439,52 @@ int llclose()
                         // DISC received -> send UA and close
                         cancelAlarm();
                         // Send UA and close
+                        printf("[llclose] Tx: received DISC from rx, replying with UA\n");
                         if(sendSupervisionFrame(A_RX,C_UA) < 0) {
                             closeSerialPort();
+                            printf("[llclose] Tx: failed to send UA reply during llclose\n");
                             return -1;
                         }
                         closeSerialPort();
+                        printf("[llclose] Tx: llclose ok\n");
                         return 0;
                     }
                 }
                 else if (r < 0 || r == 1) {
-                    // read/bcc1 error or BCC2 error: ignore until timeout 
+                    // read/bcc1 error or BCC2 error: ignore until timeout
+                    printf("[llclose] Tx: read error or BCC2 error while waiting for DISC \n");
                 }
             }
             cancelAlarm();
+            printf("[llclose] Tx: timeout waiting for rx DISC (attempt %d)\n", tries + 1);
             tries++;
         }
         closeSerialPort();
+        printf("[llclose] Tx: failed to close link after %d attempts\n", maxRetries);
         return -1; // exceeded max tries
     } 
     
     else if (role == LlRx) {
         // wait for DISC from TX
+        printf("[llclose] Rx: waiting for DISC from tx\n");
         while(TRUE) {
             int r = readFrame(header, dataBuf, &dataSize);
             if(r == 0 && checkHeader(header,A_TX,C_DISC)){
+                printf("[llclose] Rx: received DISC, starting llclose\n");
                 break;
+            }
+            if (r < 0 || r == 1) {
+                printf("[llclose] Rx: read error while waiting for DISC \n");
             }
         }
 
         // Reply (send) DISC and wait for UA
         int tries = 0;
         while(tries < maxRetries) {
+            printf("[llclose] Rx: sending DISC (attempt %d/%d)\n", tries + 1, maxRetries);
             if(sendSupervisionFrame(A_RX,C_DISC) < 0) {
                 closeSerialPort();
+                printf("[llclose] Rx: failed to send DISC on attempt %d\n", tries + 1);
                 return -1;
             }
 
@@ -462,18 +496,22 @@ int llclose()
                         // UA received -> close
                         cancelAlarm();
                         closeSerialPort();
+                        printf("[llclose] Rx: received UA, llclose ok\n");
                         return 0;
                     }
                 }
                 else if (r < 0 || r == 1) {
-                    // read/bcc1 error or BCC2 error: ignore until timeout 
+                    // read/bcc1 error or BCC2 error: ignore until timeout
+                    printf("[llclose] Rx: read error while waiting for UA \n");
                 }
             }
             cancelAlarm();
+            printf("[llclose] Rx: timeout waiting for UA (attempt %d)\n", tries + 1);
             tries++;
         }
 
         closeSerialPort();
+        printf("[llclose] Rx: llclose failed after %d attempts\n", maxRetries);
         return -1; // exceeded max tries
     }
 
