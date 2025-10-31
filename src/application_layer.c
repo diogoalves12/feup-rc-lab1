@@ -18,7 +18,7 @@
 #define T_FILENAME 0x01
 
 // Limits
-#define APP_PAYLOAD_SIZE 996
+#define APP_PAYLOAD_SIZE 997
 
 
 /////////////////////////////////////////////////
@@ -43,11 +43,11 @@ static unsigned int big_endian_len(uint64_t value) {
  *
  *        The filename length must fit in a single byte, TLV length (0 - 255).
  *
- * @param control  C_START or C_END.
+ * @param control C_START or C_END.
  * @param filename File name to advertise (lenName 0-255).
  * @param filesize File size in bytes.
  * @param[out] out Output buffer where the packet is written.
- * @param outLen   Len of @p out.
+ * @param outLen Len of @p out.
  *
  * @return Packet length (>=0) on success, or -1 on error/insufficient capacity.
  */
@@ -106,7 +106,7 @@ static int parseControlPacket(const unsigned char *packet, int len, uint64_t *fi
     if (packet[0] != C_START && packet[0] != C_END) return -1;
 
     int i = 1; // current index in packet
-    int foundSize = 0; // set once T_FILESIZE is parsed
+    int foundSize = 0; // set once T_FILESIZE is found
 
     // Iterate TLVs: [T][L][V...]
     while (i + 2 <= len) {
@@ -133,110 +133,116 @@ static int parseControlPacket(const unsigned char *packet, int len, uint64_t *fi
 
 /**
  * @brief Builds a data packet with layout:
- *        [C_DATA][SEQ][L1][L2][payload...]
+ *        [C_DATA][L1][L2][payload...]
  *        where L = (L1<<8)|L2 and 0 ≤ L ≤ APP_PAYLOAD_SIZE.
  *
- * @param seq        Packet sequence number (0..255).
- * @param payload    Pointer to the data bytes.
+ * @param payload Pointer to the data bytes.
  * @param payloadLen Number of payload bytes.
- * @param[out] out   Output buffer where the packet is written.
- * @param outLen     Capacity of @p out.
+ * @param[out] out Output buffer where the packet is written.
+ * @param outLen Capacity of @p out.
  *
  * @return Packet length (>=0) on success, or -1 on error.
  */
-static int buildDataPacket(unsigned char seq, const unsigned char *payload, unsigned int payloadLen, unsigned char *out, size_t outLen)
+static int buildDataPacket(const unsigned char *payload, unsigned int payloadLen, unsigned char *out, size_t outLen)
 {
     if (payloadLen > APP_PAYLOAD_SIZE) return -1;
 
-    // C + SEQ + L1 + L2 + payload
-    size_t need = 4 + payloadLen;
+    // C + L1 + L2 + payload
+    size_t need = 3 + payloadLen;
     if (need > outLen) return -1;
 
     out[0] = C_DATA;
-    out[1] = seq;
-    out[2] = (unsigned char)((payloadLen >> 8) & 0xFF);
-    out[3] = (unsigned char)(payloadLen & 0xFF);
-    if (payloadLen) memcpy(&out[4], payload, payloadLen);
+    out[1] = (unsigned char)((payloadLen >> 8) & 0xFF);
+    out[2] = (unsigned char)(payloadLen & 0xFF);
+    if (payloadLen) memcpy(&out[3], payload, payloadLen);
 
     return (int)need;
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Transmitter (TX) path
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////
+// Transmitter (TX)
+///////////////////////////////////////////////
 
 /**
- * @brief Transmitter path: sends C_START, a sequence of C_DATA, then C_END.
+ * @brief Transmitter: sends C_START, a sequence of C_DATA, then C_END.
  *
  * @param filename Path to the file to transmit.
  * @return 0 on success, -1 on I/O or llwrite() failure.
  */
-static int run_transmitter(const char *filename)
+static int runTransmitter(const char *filename)
 {
-    // Open source file in binary mode
+    // Open source file
     FILE *f = fopen(filename, "rb");
-    if (!f) { perror("[APP][TX] fopen"); return -1; }
+    if (!f) { perror("[APP][TX] file not found"); return -1; }
 
-    // Large buffering for efficient I/O (optional)
-    setvbuf(f, NULL, _IOFBF, 1 << 20);
+    // Determine file size (in bytes)
+    if (fseek(f, 0, SEEK_END) != 0) { 
+        perror("[APP][TX] fseek"); 
+        fclose(f); 
+        return -1; 
+    }
 
-    // Determine file size
-    if (fseek(f, 0, SEEK_END) != 0) { perror("[APP][TX] fseek"); fclose(f); return -1; }
-    long sz = ftell(f);
-    if (sz < 0) { perror("[APP][TX] ftell"); fclose(f); return -1; }
+    // ftell return cursor position in bytes (file end)
+    long size = ftell(f);
+    if (size < 0) { 
+        perror("[APP][TX] ftell");
+        fclose(f);
+        return -1; 
+    }
+
+    // return to beginning of file
     rewind(f);
 
-    // Workspace for building application packets
+    // create packet buffer
     unsigned char packet[MAX_PAYLOAD_SIZE];
 
     // Send START (metadata)
-    int ctrlLen = buildControlPacket(C_START, filename, (uint64_t)sz, packet, sizeof(packet));
+    int ctrlLen = buildControlPacket(C_START, filename, (uint64_t)size, packet, sizeof(packet));
     if (ctrlLen < 0 || llwrite(packet, ctrlLen) < 0) {
         printf("[APP][TX] failed to send START\n");
         fclose(f);
         return -1;
     }
 
-    // Send DATA sequence in chunks up to APP_PAYLOAD_SIZE
-    unsigned char seq = 0;
+    // Send DATA bytes 
     size_t totalSent = 0;
 
     while (TRUE) {
-        // Read directly into the future payload area of 'packet'
-        size_t rd = fread(&packet[4], 1, APP_PAYLOAD_SIZE, f);
+        size_t rd = fread(&packet[3], 1, APP_PAYLOAD_SIZE, f);
         if (rd == 0) break; // EOF
 
-        int dataLen = buildDataPacket(seq, &packet[4], (unsigned int)rd, packet, sizeof(packet));
+        int dataLen = buildDataPacket(&packet[3], (unsigned int)rd, packet, sizeof(packet));
         if (dataLen < 0 || llwrite(packet, dataLen) < 0) {
-            printf("[APP][TX] llwrite error on seq=%u\n", (unsigned)seq);
+            printf("[APP][TX] llwrite error while sending data\n");
             fclose(f);
             return -1;
         }
         totalSent += rd;
-        seq = (unsigned char)((seq + 1) & 0xFF);
     }
 
-    // Send END (best-effort even if it fails)
-    ctrlLen = buildControlPacket(C_END, filename, (uint64_t)sz, packet, sizeof(packet));
-    if (ctrlLen >= 0) (void)llwrite(packet, ctrlLen);
+    // Send END
+    ctrlLen = buildControlPacket(C_END, filename, (uint64_t)size, packet, sizeof(packet));
+    if (ctrlLen < 0 || llwrite(packet, ctrlLen) < 0) {
+        printf("[APP][TX] failed to build/send END packet\n");
+    } 
 
     fclose(f);
     printf("[APP][TX] data bytes sent = %zu\n", totalSent);
     return 0;
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Receiver (RX) path
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////
+// Receiver (RX)
+///////////////////////////////////////////////
 
 /**
- * @brief Receiver path: waits for C_START, receives ordered C_DATA packets,
+ * @brief Receiver: waits for C_START, receives ordered C_DATA packets,
  *        and finishes on C_END. Writes the received bytes to the output file.
  *
  * @param outFilename Path to the destination file.
  * @return 0 on success, -1 on I/O errors.
  */
-static int run_receiver(const char *outFilename)
+static int runReceiver(const char *outFilename)
 {
     unsigned char packet[MAX_PAYLOAD_SIZE];
     int len;
@@ -244,22 +250,22 @@ static int run_receiver(const char *outFilename)
     char txName[256] = {0};
 
     // Wait for START
-    for (;;) {
+    while (TRUE) {
         len = llread(packet);
         if (len <= 0) continue;
-        if (packet[0] == C_START &&
-            parseControlPacket(packet, len, &expectedSize, txName, sizeof(txName)) == 0) {
-            printf("[APP][RX] START: size=%llu, name=%s\n", (unsigned long long)expectedSize, txName[0] ? txName : "(n/a)");
+        if (packet[0] == C_START && parseControlPacket(packet, len, &expectedSize, txName, sizeof(txName)) == 0) {
+            printf("[APP][RX] START: size=%llu, name=%s\n", (unsigned long long)expectedSize, txName[0] ? txName : "unnamed");
             break;
         }
     }
 
-    // Open output file in binary mode
+    // Open output file
     FILE *out = fopen(outFilename, "wb");
-    if (!out) { perror("[APP][RX] fopen"); return -1; }
-    setvbuf(out, NULL, _IOFBF, 1 << 20);
+    if (!out) { 
+        perror("[APP][RX] fopen"); 
+        return -1; 
+    }
 
-    unsigned char expectSeq = 0;
     uint64_t written = 0;
     int done = 0;
 
@@ -268,30 +274,22 @@ static int run_receiver(const char *outFilename)
         if (len <= 0) continue;
 
         if (packet[0] == C_DATA) {
-            // Minimum header size is 4 bytes: C / SEQ / L1 / L2
-            if (len < 4) continue;
+            // Minimum header size is 3 bytes: C / L1 / L2
+            if (len < 3) continue;
 
-            unsigned char seq = packet[1];
-            unsigned int payloadLen = ((unsigned int)packet[2] << 8) | packet[3];
+            unsigned int payloadLen = ((unsigned int)packet[1] << 8) | packet[2];
 
             // Guard against malformed lengths
-            if (payloadLen > APP_PAYLOAD_SIZE || (int)(4 + payloadLen) > len) continue;
+            if (payloadLen > APP_PAYLOAD_SIZE || (int)(3 + payloadLen) > len) continue;
 
-            // Duplicate or out-of-order (link layer should prevent, but be safe)
-            if (seq != expectSeq) continue;
-
-            size_t wr = fwrite(&packet[4], 1, payloadLen, out);
+            size_t wr = fwrite(&packet[3], 1, payloadLen, out);
             if (wr != payloadLen) { perror("[APP][RX] fwrite"); break; }
             written += payloadLen;
-            expectSeq = (unsigned char)((expectSeq + 1) & 0xFF);
 
         } else if (packet[0] == C_END) {
-            // Sanity check: total received should match the advertised size
+            // total received should match the advertised size
             if (written != expectedSize) {
-                fprintf(stderr,
-                        "[APP][RX] received size (%llu) != expected size (%llu)\n",
-                        (unsigned long long)written,
-                        (unsigned long long)expectedSize);
+                printf("[APP][RX] received size (%llu) != expected size (%llu)\n", (unsigned long long)written, (unsigned long long)expectedSize);
             }
             done = 1;
         }
@@ -302,46 +300,45 @@ static int run_receiver(const char *outFilename)
     return 0;
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Application entry point
-////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////
+// Application layer
+///////////////////////////////////////////////
 
 /**
  * @brief Application layer entry point. Opens the link-layer connection (llopen),
  *        runs TX or RX according to @p role, and then closes the link (llclose).
  *
  * @param serialPort Path to the serial port device.
- * @param role       "tx" for transmitter, otherwise receiver.
- * @param baudRate   Serial baud rate (must match link-layer support).
- * @param nTries     Maximum number of retransmissions at the link layer.
- * @param timeout    Timeout (seconds) per attempt at the link layer.
- * @param filename   File path used by the TX (source) or RX (destination).
+ * @param role "tx" for transmitter, "rx" for receiver.
+ * @param baudRate Serial baud rate.
+ * @param nTries Maximum number of retransmissions.
+ * @param timeout Timeout (seconds).
+ * @param filename File path used by the TX (transmitter) or RX (receiver).
  */
-void applicationLayer(const char *serialPort, const char *role, int baudRate,
-                      int nTries, int timeout, const char *filename)
+void applicationLayer(const char *serialPort, const char *role, int baudRate, int nTries, int timeout, const char *filename)
 {
     // Initialize link-layer configuration
-    LinkLayer ll = (LinkLayer){0};
-    strncpy(ll.serialPort, serialPort, sizeof(ll.serialPort) - 1);
+    LinkLayer ll = {0};
+    strcpy(ll.serialPort, serialPort);
     ll.role = (strcmp(role, "tx") == 0) ? LlTx : LlRx;
     ll.baudRate = baudRate;
     ll.nRetransmissions = nTries;
     ll.timeout = timeout;
 
-    // Open link-layer connection (performs SET/UA handshake)
+    // Open link-layer connection (performs SET/UA)
     printf("[APP] calling llopen (role=%s)\n", role);
     if (llopen(ll) != 0) {
         printf("[APP] llopen FAILED\n");
         return;
     }
 
-    // Run TX or RX path
-    int status = (ll.role == LlTx) ? run_transmitter(filename) : run_receiver(filename);
+    // Run TX or RX 
+    int status = (ll.role == LlTx) ? runTransmitter(filename) : runReceiver(filename);
 
     // Close link-layer connection (performs DISC/UA)
     printf("[APP] calling llclose\n");
-    int cr = llclose();
-    printf("[APP] llclose %s\n", (cr == 0) ? "OK" : "FAILED");
+    int c = llclose();
+    printf("[APP] llclose %s\n", (c == 0) ? "OK" : "FAILED");
 
     if (status != 0) {
         printf("[APP] completed with errors\n");
