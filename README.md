@@ -48,3 +48,10 @@ Useful cable console commands: `help`, `on`, `off`, `ber <val>`, `baud <rate>`, 
 ### Verify files
 - Compare files: - `make check_files` or `diff -s penguin.gif penguin-received.gif`
 
+## Manual Measurement Workflow
+
+1. Start the cable console in terminal A (`make && make run_cable`) and configure the run parameters interactively (`ber`, `prop`, `baud`).
+2. Launch the receiver in terminal B: `/usr/bin/time -f "%e" -o rx_time.txt ./bin/main /dev/ttyS11 <BAUD> rx penguin-received.gif`.
+3. Launch the transmitter in terminal C: `/usr/bin/time -f "%e" -o tx_time.txt ./bin/main /dev/ttyS10 <BAUD> tx penguin.gif`.
+4. After both terminals finish, record the experiment with `python3 add_result.py SCEN BAUD PROP_US BER PAYLOAD_B RUN_INDEX [OVERHEAD_BYTES] [LBYTES_HINT]` or run the guided helper `./run_once.sh`.
+5. Repeat for every point in the FER / PROP / BAUD / PAYLOAD sweeps (3 runs per point), then run `python3 plot_efficiency.py` to produce the four report figures.
